@@ -148,6 +148,19 @@ describe('the ledger reporter', () => {
     ).resolves.toBeUndefined()
   })
 
+  it('writes nothing when disabled by environment', async () => {
+    process.env['TEST_LEDGER_DISABLED'] = '1'
+    const reporter = new TestLedgerReporter({ lane: 'unit', packageName: '@repo/db' })
+    await reporter.onTestModuleEnd(
+      fakeModule({
+        moduleId: '/abs/e.test.ts',
+        tests: [{ fullName: 'e > works', state: 'passed', duration: 1, startTime: 1 }],
+      }) as never,
+    )
+    delete process.env['TEST_LEDGER_DISABLED']
+    expect(() => readdirSync(path.join(directory, 'runs'))).toThrow()
+  })
+
   it('mints its own run id when the envelope is absent', async () => {
     delete process.env['TEST_LEDGER_RUN_ID']
     const reporter = new TestLedgerReporter({ lane: 'unit', packageName: '@repo/db' })

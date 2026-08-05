@@ -26,6 +26,12 @@ var TestLedgerReporter = class {
   #disabled = false
   #directoryReady = false
   constructor(options) {
+    /**
+     * An escape hatch that must exist before anyone needs it: if the ledger
+     * ever perturbs a run, a developer has to be able to take it out of the
+     * path without editing a shared config every worktree depends on.
+     */
+    if (process.env['TEST_LEDGER_DISABLED'] === '1') this.#disabled = true
     this.#lane = options.lane
     this.#packageName = options.packageName
     /**
