@@ -8,11 +8,30 @@ import {
   s as runsReport,
   t as openLedger,
   u as table,
-} from './open-oPNCFCsS.mjs'
-import './paths-BHEus8S7.mjs'
+} from './open-W_R1LvBi.mjs'
+import { a as runDir } from './paths-BtOSn20v.mjs'
+import { rm } from 'node:fs/promises'
 import meow from 'meow'
 
 //#region src/cli.ts
+/**
+ * Removes one run's NDJSON directory.
+ *
+ * A missing directory is not an error: the run may have been ingested on one
+ * machine and pruned on another, or a prior prune already removed it. Only
+ * `ENOENT` is swallowed, mirroring the narrowing `ingest.ts`'s
+ * `readRunEvents` applies to the same failure mode; any other error (a
+ * permissions problem, a busy handle) is a real filesystem failure and must
+ * propagate.
+ */
+async function removeRunDirectory(runId) {
+  try {
+    await rm(runDir(runId), { recursive: true })
+  } catch (error) {
+    if (error.code === 'ENOENT') return
+    throw error
+  }
+}
 /** The `test-ledger` bin entry point: ingest, the five reports, and prune. */
 const cli = meow(
   `
@@ -26,7 +45,7 @@ const cli = meow(
     contention   Runs ranked by host load while they ran
     shape        Where time goes, by package and lane
     runs         Recent run history
-    prune        Delete runs older than --days from the database
+    prune        Delete runs and their NDJSON older than --days
 
   Options
     --min-runs   Minimum appearances before a test can be called flaky (default 3)
@@ -87,6 +106,16 @@ else if (command === 'prune') {
         .run(staleRunIds)
   }
   await database.prepare('DELETE FROM runs WHERE started_at < ?').run([cutoff])
+  /**
+   * Age-based, not delete-after-ingest: the raw NDJSON stays available for
+   * the whole retention window (phase 2 re-ingests into a fresh synced
+   * database from exactly this retained NDJSON), and disk is still bounded
+   * once a run ages past it. `ingested_runs` is left untouched here — it is
+   * what stops a pruned run's directory from being silently re-ingested if
+   * it ever reappears (a restored backup, a synced copy from another
+   * machine), not a leftover this command forgot.
+   */
+  for (const runId of staleRunIds) await removeRunDirectory(runId)
   console.log(`pruned runs older than ${cli.flags.days} days`)
 } else {
   console.error(`unknown command: ${command}`)

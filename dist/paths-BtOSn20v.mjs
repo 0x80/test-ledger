@@ -1,5 +1,5 @@
-import path from 'node:path'
 import { homedir } from 'node:os'
+import path from 'node:path'
 
 //#region src/paths.ts
 /**

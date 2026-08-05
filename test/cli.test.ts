@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -102,8 +102,15 @@ describe('the prune subcommand', () => {
    * children first (tests, files, run_samples, turbo_tasks) and `runs` last;
    * the reverse order would strand the children, since their own delete is a
    * subquery over `runs`.
+   *
+   * Also confirms `prune` removes the old run's NDJSON directory from disk
+   * (age-based, not delete-after-ingest, so the retained NDJSON still backs a
+   * future re-ingest until it ages out) while leaving the recent run's
+   * directory in place. Asserted on the filesystem, not just the database:
+   * the database assertions above would pass even if the directory removal
+   * silently did nothing.
    */
-  it('deletes only the runs older than the retention window, from every table', async () => {
+  it('deletes only the runs older than the retention window, from every table and from disk', async () => {
     const dayMs = 24 * 60 * 60 * 1000
     const oldStartedAt = Date.now() - 200 * dayMs
     const recentStartedAt = Date.now() - 1 * dayMs
@@ -129,5 +136,8 @@ describe('the prune subcommand', () => {
       expect(runIds).not.toContain('old')
       expect(runIds).toContain('recent')
     }
+
+    expect(existsSync(path.join(pruneDirectory, 'runs', 'old'))).toBe(false)
+    expect(existsSync(path.join(pruneDirectory, 'runs', 'recent'))).toBe(true)
   })
 })
