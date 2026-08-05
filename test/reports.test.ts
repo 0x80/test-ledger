@@ -1,0 +1,111 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { flakyReport } from '../src/reports/flaky.ts'
+import { slowReport } from '../src/reports/slow.ts'
+import { ingestAll } from '../src/store/ingest.ts'
+import { openLedger } from '../src/store/open.ts'
+
+let directory: string
+
+beforeEach(() => {
+  directory = mkdtempSync(path.join(tmpdir(), 'ledger-'))
+  process.env['TEST_LEDGER_DIR'] = directory
+})
+
+afterEach(() => {
+  delete process.env['TEST_LEDGER_DIR']
+})
+
+function writeRun(runId: string, events: Record<string, unknown>[]): void {
+  const runDirectory = path.join(directory, 'runs', runId)
+  mkdirSync(runDirectory, { recursive: true })
+  writeFileSync(
+    path.join(runDirectory, '1.ndjson'),
+    `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+  )
+}
+
+/** Four runs of one test: three pass, one fails with a timeout. */
+function seedFlaky(): void {
+  for (const [index, state] of ['passed', 'failed', 'passed', 'passed'].entries()) {
+    writeRun(`r${index}`, [
+      {
+        kind: 'file',
+        runId: `r${index}`,
+        file: '/a.test.ts',
+        lane: 'unit',
+        durationMs: 100,
+        passed: state === 'passed' ? 1 : 0,
+        failed: state === 'failed' ? 1 : 0,
+      },
+      {
+        kind: 'test',
+        runId: `r${index}`,
+        file: '/a.test.ts',
+        fullName: 'a > sometimes',
+        state,
+        durationMs: 10,
+        ...(state === 'failed' ? { failureClass: 'timeout' } : {}),
+      },
+    ])
+  }
+}
+
+describe('reports', () => {
+  it('ranks a flaky test with its denominator', async () => {
+    seedFlaky()
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await flakyReport(database, { minRuns: 2 })
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      file: '/a.test.ts',
+      fullName: 'a > sometimes',
+      runs: 4,
+      failures: 1,
+    })
+    expect(rows[0]?.failureRate).toBeCloseTo(0.25)
+    expect(rows[0]?.classes).toContain('timeout')
+  })
+
+  /** A test that always passes is not flaky and must not appear. */
+  it('omits a test that never failed', async () => {
+    writeRun('r1', [
+      { kind: 'test', runId: 'r1', file: '/b.ts', fullName: 'b > x', state: 'passed' },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    expect(await flakyReport(database, { minRuns: 1 })).toHaveLength(0)
+  })
+
+  /** Below the denominator threshold a rate is noise, not signal. */
+  it('omits a test seen fewer times than minRuns', async () => {
+    writeRun('r1', [
+      { kind: 'test', runId: 'r1', file: '/c.ts', fullName: 'c > x', state: 'failed' },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    expect(await flakyReport(database, { minRuns: 5 })).toHaveLength(0)
+  })
+
+  it('ranks slow files by share of total wall-clock', async () => {
+    writeRun('r1', [
+      { kind: 'file', runId: 'r1', file: '/fast.ts', lane: 'unit', durationMs: 100 },
+      { kind: 'file', runId: 'r1', file: '/slow.ts', lane: 'unit', durationMs: 900 },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await slowReport(database, { limit: 10 })
+
+    expect(rows[0]).toMatchObject({ file: '/slow.ts', totalMs: 900 })
+    expect(rows[0]?.shareOfTotal).toBeCloseTo(0.9)
+  })
+})
