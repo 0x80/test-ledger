@@ -1,0 +1,19 @@
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      glob: '*.{js,ts,mjs,cjs,json,jsonc,md,yaml,yml}'
+      run: pnpm exec oxfmt --no-error-on-unmatched-pattern {staged_files}
+      stage_fixed: true
+    lint:
+      glob: '*.{js,ts,mjs,cjs}'
+      run: pnpm exec oxlint -c .oxlintrc.json --import-plugin --type-aware --no-error-on-unmatched-pattern {staged_files}
+    dist-freshness:
+      glob: '*.{ts,mts,cts}'
+      # `pnpm build` alone never matches a committed dist/: tsdown's raw
+      # rolldown/esbuild output style differs from oxfmt's (verified on a
+      # clean checkout of an unmodified commit - rebuilding it, unformatted,
+      # diffs ~1200 lines against its own committed dist/cli.mjs). The
+      # canonical committed state is build *then* format, so the freshness
+      # check has to reproduce that, or it fails even a correctly-staged commit.
+      run: 'pnpm build >/dev/null && pnpm format >/dev/null && git diff --quiet -- dist || (echo "dist/ is stale, run pnpm build, pnpm format, and git add dist before committing" >&2 && exit 1)'
