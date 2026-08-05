@@ -9,6 +9,7 @@ describe('failure classification', () => {
     ['UND_ERR_HEADERS_TIMEOUT', 'db_timeout'],
     ['Connection terminated due to connection timeout', 'db_timeout'],
     ['SQLITE_BUSY: database is locked', 'db_timeout'],
+    ['Connection timeout while connecting to Postgres', 'db_timeout'],
   ])('classifies %j as %s', (message, expected) => {
     expect(classifyFailure({ message })).toBe(expected)
   })
@@ -43,12 +44,13 @@ describe('failure classification', () => {
 
   /**
    * The DB-timeout class exists to separate host-capacity artifacts from
-   * genuine flakes, so an engine timeout must not be swallowed by the generic
-   * timeout rule.
+   * genuine flakes. This input matches both the db_timeout rule
+   * (UND_ERR_HEADERS_TIMEOUT) and the generic timeout rule (timed out in Xms),
+   * so the assertion only passes when db_timeout is checked first.
    */
-  it('prefers db_timeout over timeout for an engine-level timeout', () => {
-    expect(classifyFailure({ message: 'Connection timeout while connecting to Postgres' })).toBe(
-      'db_timeout',
-    )
+  it('prefers db_timeout over timeout when both patterns could match', () => {
+    expect(
+      classifyFailure({ message: 'UND_ERR_HEADERS_TIMEOUT: Headers timed out in 5000ms' }),
+    ).toBe('db_timeout')
   })
 })
