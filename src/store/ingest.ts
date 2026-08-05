@@ -16,7 +16,15 @@ function readRunEvents(runId: string): LedgerEvent[] {
   const directory = runDir(runId)
   const events: LedgerEvent[] = []
 
-  for (const name of readdirSync(directory)) {
+  let names: string[]
+  try {
+    names = readdirSync(directory)
+  } catch {
+    /** No directory for this run id: a no-op, not a crash. */
+    return events
+  }
+
+  for (const name of names) {
     if (!name.endsWith('.ndjson')) continue
 
     const contents = readFileSync(path.join(directory, name), 'utf8')
@@ -37,18 +45,33 @@ function readRunEvents(runId: string): LedgerEvent[] {
 /**
  * Folds one run's events into the tables.
  *
- * Idempotent by primary key rather than by a "have I seen this" check alone:
- * an upsert on `(run_id, file, full_name)` means a re-ingest of the same
- * directory converges rather than double-counting, which matters because
- * every rate the reports compute uses these rows as its denominator.
+ * Idempotent two ways at once, deliberately layered rather than relying on
+ * either alone:
  *
- * The upserts use `INSERT ... ON CONFLICT ... DO UPDATE SET`, not
- * `INSERT OR REPLACE`: the installed `@tursodatabase/database@0.3.2` engine
- * rejects `INSERT OR REPLACE` at prepare time with "is only supported with
- * UPSERT", so the SQLite shorthand does not carry over to this driver. The
- * upsert form is the standard-SQL equivalent and converges to the same rows.
+ * 1. A short-circuit up front: if `ingested_runs` already has this `runId`,
+ *    return `0` without touching any table. This is what makes the whole run
+ *    idempotent, including `run_samples` and `turbo_tasks`, which are plain
+ *    `INSERT` with no primary key (append-only time series, by design) and so
+ *    have no per-row convergence of their own — without this check, a second
+ *    `ingestRun` on an already-completed directory would duplicate their rows.
+ * 2. Per-row upserts (`INSERT ... ON CONFLICT ... DO UPDATE SET`) on `runs`,
+ *    `files`, and `tests`. These stay even though (1) makes them redundant on
+ *    a *completed* re-ingest, because they are what makes a *partial* one
+ *    safe: a prior process that died mid-ingest never reached the final
+ *    `ingested_runs` write, so the short-circuit does not fire and the run
+ *    re-executes in full, converging on the same rows rather than duplicating
+ *    the partial write. `INSERT OR REPLACE` was the natural spelling for
+ *    that, but the installed `@tursodatabase/database@0.3.2` engine rejects it
+ *    at prepare time with "is only supported with UPSERT", so the upsert form
+ *    is used instead; it is the standard-SQL equivalent and converges to the
+ *    same rows.
  */
 export async function ingestRun(database: Ledger, runId: string): Promise<number> {
+  const alreadyIngested: unknown = await database
+    .prepare('SELECT 1 FROM ingested_runs WHERE run_id = ?')
+    .get([runId])
+  if (alreadyIngested !== undefined) return 0
+
   const events = readRunEvents(runId)
   let rows = 0
 

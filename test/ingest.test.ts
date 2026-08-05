@@ -61,6 +61,35 @@ describe('ingest', () => {
     expect(tests).toHaveLength(1)
   })
 
+  /**
+   * `run_samples` and `turbo_tasks` have no primary key, so their idempotency
+   * comes entirely from `ingestRun`'s short-circuit, not a per-row upsert.
+   * The other idempotency test only checks `tests`, which would miss a
+   * regression here.
+   */
+  it('is idempotent for append-only tables with no primary key', async () => {
+    writeRun('r1', [
+      { kind: 'file', runId: 'r1', file: '/a.test.ts', lane: 'unit', passed: 1, failed: 0 },
+      { kind: 'test', runId: 'r1', file: '/a.test.ts', fullName: 'a > x', state: 'passed' },
+      { kind: 'sample', runId: 'r1', at: 100, load1: 0.5, load5: 0.4 },
+      { kind: 'turbo_task', runId: 'r1', packageName: '@repo/foo', task: 'build' },
+    ])
+
+    const database = await openLedger()
+    await ingestRun(database, 'r1')
+    await ingestRun(database, 'r1')
+
+    expect(await database.prepare('SELECT * FROM run_samples').all()).toHaveLength(1)
+    expect(await database.prepare('SELECT * FROM turbo_tasks').all()).toHaveLength(1)
+  })
+
+  /** A caller naming a run directory that was never written gets a no-op, not a crash. */
+  it('is a no-op when the run directory does not exist', async () => {
+    const database = await openLedger()
+
+    await expect(ingestRun(database, 'never-written')).resolves.toBe(0)
+  })
+
   /** A crashed writer leaves a truncated last line; one bad line must not lose the run. */
   it('skips malformed lines rather than discarding the run', async () => {
     const runDirectory = path.join(directory, 'runs', 'r2')
