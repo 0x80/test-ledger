@@ -95,6 +95,55 @@ describe('reports', () => {
     expect(await flakyReport(database, { minRuns: 5 })).toHaveLength(0)
   })
 
+  /**
+   * The denominator must be the number of runs THIS test appeared in, not the
+   * total number of runs in the ledger. r1/r2 carry test A only; r3/r4 carry an
+   * unrelated test B and never mention A. A denominator computed from the
+   * whole ledger would read A as 4 runs / 1 failure (rate 0.25); the correct
+   * per-test count is 2 runs / 1 failure (rate 0.5). A test added recently must
+   * not read as more stable merely because the ledger holds older runs it was
+   * never part of.
+   */
+  it('scopes the denominator to runs the test appeared in, not every run in the ledger', async () => {
+    writeRun('r1', [
+      { kind: 'test', runId: 'r1', file: '/a.test.ts', fullName: 'a > sometimes', state: 'passed' },
+    ])
+    writeRun('r2', [
+      { kind: 'test', runId: 'r2', file: '/a.test.ts', fullName: 'a > sometimes', state: 'failed' },
+    ])
+    writeRun('r3', [
+      { kind: 'test', runId: 'r3', file: '/b.test.ts', fullName: 'b > other', state: 'passed' },
+    ])
+    writeRun('r4', [
+      { kind: 'test', runId: 'r4', file: '/b.test.ts', fullName: 'b > other', state: 'passed' },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await flakyReport(database, { minRuns: 2 })
+    const row = rows.find((candidate) => candidate.fullName === 'a > sometimes')
+
+    expect(row).toMatchObject({ runs: 2, failures: 1 })
+    expect(row?.failureRate).toBeCloseTo(0.5)
+  })
+
+  /** GROUP_CONCAT(DISTINCT ...) returns NULL for an all-NULL group; the row must surface '' instead. */
+  it('reports an empty classes string when the failure has no class', async () => {
+    writeRun('r1', [
+      { kind: 'test', runId: 'r1', file: '/d.ts', fullName: 'd > x', state: 'failed' },
+    ])
+    writeRun('r2', [
+      { kind: 'test', runId: 'r2', file: '/d.ts', fullName: 'd > x', state: 'passed' },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await flakyReport(database, { minRuns: 2 })
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.classes).toBe('')
+  })
+
   it('ranks slow files by share of total wall-clock', async () => {
     writeRun('r1', [
       { kind: 'file', runId: 'r1', file: '/fast.ts', lane: 'unit', durationMs: 100 },
