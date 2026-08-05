@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -88,6 +88,26 @@ describe('ingest', () => {
     const database = await openLedger()
 
     await expect(ingestRun(database, 'never-written')).resolves.toBe(0)
+  })
+
+  /**
+   * ENOENT (no directory) is the only error `readRunEvents` swallows. A real
+   * filesystem failure, exercised here as an unreadable run directory, must
+   * reject rather than silently becoming an all-null `runs` row.
+   */
+  it('rejects rather than swallowing a real filesystem error', async () => {
+    const runDirectory = path.join(directory, 'runs', 'r4')
+    mkdirSync(runDirectory, { recursive: true })
+    chmodSync(runDirectory, 0o000)
+
+    try {
+      const database = await openLedger()
+
+      await expect(ingestRun(database, 'r4')).rejects.toThrow()
+    } finally {
+      /** Restore so the temp directory can still be cleaned up. */
+      chmodSync(runDirectory, 0o755)
+    }
   })
 
   /** A crashed writer leaves a truncated last line; one bad line must not lose the run. */

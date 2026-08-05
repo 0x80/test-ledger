@@ -19,9 +19,18 @@ function readRunEvents(runId: string): LedgerEvent[] {
   let names: string[]
   try {
     names = readdirSync(directory)
-  } catch {
-    /** No directory for this run id: a no-op, not a crash. */
-    return events
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      /** No directory for this run id: a no-op, not a crash. */
+      return events
+    }
+    /**
+     * Anything else (`EACCES`, `ELOOP`, `EMFILE`, ...) is a real filesystem
+     * failure, not a normal "run never happened" case. Swallowing it here
+     * would write an all-null `runs` row as though the run were genuinely
+     * empty, hiding the actual problem, so it must propagate instead.
+     */
+    throw error
   }
 
   for (const name of names) {
