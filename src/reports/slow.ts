@@ -9,11 +9,17 @@ export type SlowRow = {
 }
 
 /**
- * Ranks files by total wall-clock, with each file's share of the whole.
+ * Ranks files by summed duration, with each file's share of the column total.
  *
  * Share rather than raw duration is the ranking that answers "what would
  * cutting this actually buy": a 3s file run on every branch costs more than a
  * 40s file run once a week, and only the share makes that visible.
+ *
+ * `shareOfTotal` is share of `SUM(duration_ms)` **summed across every file
+ * row** — not of the run's wall-clock. A `pnpm test` invocation fans out to
+ * roughly two dozen parallel Vitest processes, so the denominator here is on
+ * the order of 24x wall-clock; a file reading `shareOfTotal: 0.09` did not
+ * cost 9% of the run's actual duration, only 9% of the summed per-file time.
  */
 export async function slowReport(
   database: Ledger,

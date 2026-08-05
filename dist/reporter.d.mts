@@ -52,7 +52,13 @@ type ReporterTestModule = {
  */
 declare class TestLedgerReporter {
   #private
-  constructor(options: ReporterOptions)
+  /**
+   * `options` is optional and each field defaults defensively: everything
+   * after construction is wrapped in the same "never fail the run" guarantee,
+   * and a hand-written Vitest config that forgets to pass reporter options (or
+   * passes an empty object) must not throw at Vitest startup either.
+   */
+  constructor(options?: Partial<ReporterOptions>)
   onTestModuleEnd(testModule: ReporterTestModule): Promise<void>
 }
 //#endregion

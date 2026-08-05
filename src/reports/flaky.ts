@@ -6,6 +6,7 @@ export type FlakyRow = {
   runs: number
   failures: number
   failureRate: number
+  retries: number
   classes: string
 }
 
@@ -18,6 +19,13 @@ export type FlakyRow = {
  * aggregated into the row because the class is what separates a genuine flake
  * from a host-capacity artifact: a test failing only as `timeout` under load is
  * a different problem from one failing as `assertion`.
+ *
+ * A test surfaces if it either failed outright, or passed only after a retry:
+ * Vitest's own retry mechanism means a test that failed then passed on retry
+ * records `state = 'passed'` with `retry_count > 0`, so `failures > 0` alone
+ * would miss it even though it is exactly the kind of instability this report
+ * exists to surface. `retries` counts the runs in which this test needed at
+ * least one retry, alongside the run/failure counts.
  */
 export async function flakyReport(
   database: Ledger,
@@ -31,11 +39,12 @@ export async function flakyReport(
               full_name AS fullName,
               COUNT(*) AS runs,
               SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failures,
+              SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retries,
               GROUP_CONCAT(DISTINCT failure_class) AS classes
          FROM tests
         WHERE state IN ('passed', 'failed')
         GROUP BY file, full_name
-       HAVING failures > 0 AND runs >= ?
+       HAVING (failures > 0 OR retries > 0) AND runs >= ?
         ORDER BY (CAST(failures AS REAL) / runs) DESC, failures DESC`,
     )
     .all([minRuns])
@@ -46,6 +55,7 @@ export async function flakyReport(
       fullName: string
       runs: number
       failures: number
+      retries: number
       classes: string | null
     }
     return {
@@ -54,6 +64,7 @@ export async function flakyReport(
       runs: record.runs,
       failures: record.failures,
       failureRate: record.failures / record.runs,
+      retries: record.retries,
       classes: record.classes ?? '',
     }
   })

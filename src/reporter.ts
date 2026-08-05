@@ -58,7 +58,13 @@ export default class TestLedgerReporter {
   #disabled = false
   #directoryReady = false
 
-  constructor(options: ReporterOptions) {
+  /**
+   * `options` is optional and each field defaults defensively: everything
+   * after construction is wrapped in the same "never fail the run" guarantee,
+   * and a hand-written Vitest config that forgets to pass reporter options (or
+   * passes an empty object) must not throw at Vitest startup either.
+   */
+  constructor(options?: Partial<ReporterOptions>) {
     /**
      * An escape hatch that must exist before anyone needs it: if the ledger
      * ever perturbs a run, a developer has to be able to take it out of the
@@ -66,8 +72,8 @@ export default class TestLedgerReporter {
      */
     if (process.env['TEST_LEDGER_DISABLED'] === '1') this.#disabled = true
 
-    this.#lane = options.lane
-    this.#packageName = options.packageName
+    this.#lane = options?.lane ?? 'unknown'
+    this.#packageName = options?.packageName ?? 'unknown'
     /**
      * An ad-hoc `pnpm --filter x test` runs outside the budget wrapper and so
      * has no envelope. Minting an id here means that run is still recorded

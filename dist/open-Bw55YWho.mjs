@@ -1,4 +1,4 @@
-import { a as runDir, i as ledgerDir, o as runsDir, t as databasePath } from './paths-BtOSn20v.mjs'
+import { a as runDir, i as ledgerDir, o as runsDir, t as databasePath } from './paths-BfgS-0Zu.mjs'
 import path from 'node:path'
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { connect } from '@tursodatabase/database'
@@ -7,6 +7,12 @@ import { connect } from '@tursodatabase/database'
 /** Renders rows as an aligned table, or a stated absence. */
 function table(rows, emptyMessage) {
   if (rows.length === 0) return emptyMessage
+  /**
+   * Every current report returns homogeneous rows (one fixed shape per
+   * report), so reading columns from the first row alone always matches the
+   * rest. A report that ever mixed row shapes would need a union of keys
+   * here instead; that branch is unreachable today.
+   */
   const columns = Object.keys(rows[0] ?? {})
   const rendered = rows.map((row) => columns.map((column) => renderCell(row[column])))
   const widths = columns.map((column, index) =>
@@ -79,6 +85,13 @@ async function contentionReport(database, options = {}) {
  * aggregated into the row because the class is what separates a genuine flake
  * from a host-capacity artifact: a test failing only as `timeout` under load is
  * a different problem from one failing as `assertion`.
+ *
+ * A test surfaces if it either failed outright, or passed only after a retry:
+ * Vitest's own retry mechanism means a test that failed then passed on retry
+ * records `state = 'passed'` with `retry_count > 0`, so `failures > 0` alone
+ * would miss it even though it is exactly the kind of instability this report
+ * exists to surface. `retries` counts the runs in which this test needed at
+ * least one retry, alongside the run/failure counts.
  */
 async function flakyReport(database, options = {}) {
   const minRuns = options.minRuns ?? 3
@@ -88,11 +101,12 @@ async function flakyReport(database, options = {}) {
               full_name AS fullName,
               COUNT(*) AS runs,
               SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failures,
+              SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retries,
               GROUP_CONCAT(DISTINCT failure_class) AS classes
          FROM tests
         WHERE state IN ('passed', 'failed')
         GROUP BY file, full_name
-       HAVING failures > 0 AND runs >= ?
+       HAVING (failures > 0 OR retries > 0) AND runs >= ?
         ORDER BY (CAST(failures AS REAL) / runs) DESC, failures DESC`)
       .all([minRuns])
   ).map((row) => {
@@ -103,6 +117,7 @@ async function flakyReport(database, options = {}) {
       runs: record.runs,
       failures: record.failures,
       failureRate: record.failures / record.runs,
+      retries: record.retries,
       classes: record.classes ?? '',
     }
   })
@@ -137,17 +152,35 @@ async function runsReport(database, options = {}) {
  * The environment column is the one worth watching: it is what turns "jsdom
  * costs us something" from a number someone measured once by hand into a
  * standing figure.
+ *
+ * `turboTasks` / `turboCacheHits` / `turboCacheMisses` come from `turbo_tasks`,
+ * joined in by package only: Turbo's cache is a per-package/per-task concept
+ * with no lane of its own, so every lane row for a package repeats the same
+ * three figures rather than splitting them. A cache miss is any status other
+ * than `HIT` (`MISS`, `UNKNOWN`, ...), read as "this task actually ran" rather
+ * than "this task was served from cache."
  */
 async function shapeReport(database) {
   return await database
-    .prepare(`SELECT COALESCE(package_name, '') AS packageName,
-              COALESCE(lane, '') AS lane,
+    .prepare(`SELECT COALESCE(f.package_name, '') AS packageName,
+              COALESCE(f.lane, '') AS lane,
               COUNT(*) AS files,
-              COALESCE(SUM(duration_ms), 0) AS totalMs,
-              COALESCE(SUM(setup_ms), 0) AS setupMs,
-              COALESCE(SUM(environment_setup_ms), 0) AS environmentSetupMs
-         FROM files
-        GROUP BY package_name, lane
+              COALESCE(SUM(f.duration_ms), 0) AS totalMs,
+              COALESCE(SUM(f.setup_ms), 0) AS setupMs,
+              COALESCE(SUM(f.environment_setup_ms), 0) AS environmentSetupMs,
+              COALESCE(t.turboTasks, 0) AS turboTasks,
+              COALESCE(t.turboCacheHits, 0) AS turboCacheHits,
+              COALESCE(t.turboCacheMisses, 0) AS turboCacheMisses
+         FROM files f
+         LEFT JOIN (
+           SELECT package_name,
+                  COUNT(*) AS turboTasks,
+                  SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END) AS turboCacheHits,
+                  SUM(CASE WHEN cache_status != 'HIT' THEN 1 ELSE 0 END) AS turboCacheMisses
+             FROM turbo_tasks
+            GROUP BY package_name
+         ) t ON t.package_name = f.package_name
+        GROUP BY f.package_name, f.lane
         ORDER BY totalMs DESC`)
     .all()
 }
@@ -155,11 +188,17 @@ async function shapeReport(database) {
 //#endregion
 //#region src/reports/slow.ts
 /**
- * Ranks files by total wall-clock, with each file's share of the whole.
+ * Ranks files by summed duration, with each file's share of the column total.
  *
  * Share rather than raw duration is the ranking that answers "what would
  * cutting this actually buy": a 3s file run on every branch costs more than a
  * 40s file run once a week, and only the share makes that visible.
+ *
+ * `shareOfTotal` is share of `SUM(duration_ms)` **summed across every file
+ * row** — not of the run's wall-clock. A `pnpm test` invocation fans out to
+ * roughly two dozen parallel Vitest processes, so the denominator here is on
+ * the order of 24x wall-clock; a file reading `shareOfTotal: 0.09` did not
+ * cost 9% of the run's actual duration, only 9% of the summed per-file time.
  */
 async function slowReport(database, options = {}) {
   const limit = options.limit ?? 25
@@ -330,13 +369,26 @@ async function ingestRun(database, runId) {
       await database
         .prepare(`INSERT INTO run_samples (run_id, at, load1, load5, free_memory_bytes, live_slots)
            VALUES (?,?,?,?,?,?)`)
-        .run([runId, event.at, event.load1, event.load5, event.freeMemoryBytes, event.liveSlots])
+        .run([
+          runId,
+          event.at ?? null,
+          event.load1 ?? null,
+          event.load5 ?? null,
+          event.freeMemoryBytes ?? null,
+          event.liveSlots ?? null,
+        ])
       rows += 1
     } else if (event.kind === 'turbo_task') {
       await database
         .prepare(`INSERT INTO turbo_tasks (run_id, package_name, task, duration_ms, cache_status)
            VALUES (?,?,?,?,?)`)
-        .run([runId, event.packageName, event.task, event.durationMs, event.cacheStatus])
+        .run([
+          runId,
+          event.packageName ?? null,
+          event.task ?? null,
+          event.durationMs ?? null,
+          event.cacheStatus ?? null,
+        ])
       rows += 1
     } else if (event.kind === 'file') {
       await database
@@ -466,9 +518,18 @@ CREATE TABLE IF NOT EXISTS runs (
   has_envelope INTEGER NOT NULL DEFAULT 0
 );
 
+/**
+ * No primary key: an append-only time series, and neither \`at\` nor any other
+ * column is needed to make a row unique, so none but \`run_id\` is NOT NULL.
+ * \`isLedgerEvent\` validates only \`kind\` and \`runId\` before ingest ever sees a
+ * row, so a truncated-but-parseable \`sample\` line legitimately reaches this
+ * insert missing \`at\`; a NOT NULL constraint there would turn one malformed
+ * telemetry line into a thrown error that aborts ingest of the rest of the
+ * run, which is the trade this table is designed to avoid.
+ */
 CREATE TABLE IF NOT EXISTS run_samples (
   run_id TEXT NOT NULL,
-  at INTEGER NOT NULL,
+  at INTEGER,
   load1 REAL,
   load5 REAL,
   free_memory_bytes INTEGER,
@@ -476,10 +537,11 @@ CREATE TABLE IF NOT EXISTS run_samples (
 );
 CREATE INDEX IF NOT EXISTS run_samples_run_at ON run_samples (run_id, at);
 
+/** Same reasoning as \`run_samples\`: no primary key, so only \`run_id\` is NOT NULL. */
 CREATE TABLE IF NOT EXISTS turbo_tasks (
   run_id TEXT NOT NULL,
-  package_name TEXT NOT NULL,
-  task TEXT NOT NULL,
+  package_name TEXT,
+  task TEXT,
   duration_ms INTEGER,
   cache_status TEXT
 );

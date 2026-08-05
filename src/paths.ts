@@ -20,5 +20,11 @@ export const eventsPath = (runId: string, pid: number): string =>
 
 export const databasePath = (): string => path.join(ledgerDir(), 'ledger.db')
 
-/** Held by `ingest` so concurrent runs cannot write the database at once. */
+/**
+ * Reserved for when ingest becomes automated (phase 2 wiring it into the
+ * test-selection harness). Nothing acquires this lock today: concurrent
+ * `ingest` invocations are currently unguarded, and the path exists so the
+ * automated caller has somewhere to acquire it without a later schema/path
+ * change.
+ */
 export const ingestLockPath = (): string => path.join(ledgerDir(), 'ingest.lock')

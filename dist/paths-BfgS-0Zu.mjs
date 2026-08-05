@@ -15,7 +15,13 @@ const runDir = (runId) => path.join(runsDir(), runId)
 /** Per-process, so concurrent writers never share a file handle or a lock. */
 const eventsPath = (runId, pid) => path.join(runDir(runId), `${pid}.ndjson`)
 const databasePath = () => path.join(ledgerDir(), 'ledger.db')
-/** Held by `ingest` so concurrent runs cannot write the database at once. */
+/**
+ * Reserved for when ingest becomes automated (phase 2 wiring it into the
+ * test-selection harness). Nothing acquires this lock today: concurrent
+ * `ingest` invocations are currently unguarded, and the path exists so the
+ * automated caller has somewhere to acquire it without a later schema/path
+ * change.
+ */
 const ingestLockPath = () => path.join(ledgerDir(), 'ingest.lock')
 
 //#endregion

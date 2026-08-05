@@ -139,7 +139,14 @@ export async function ingestRun(database: Ledger, runId: string): Promise<number
           `INSERT INTO run_samples (run_id, at, load1, load5, free_memory_bytes, live_slots)
            VALUES (?,?,?,?,?,?)`,
         )
-        .run([runId, event.at, event.load1, event.load5, event.freeMemoryBytes, event.liveSlots])
+        .run([
+          runId,
+          event.at ?? null,
+          event.load1 ?? null,
+          event.load5 ?? null,
+          event.freeMemoryBytes ?? null,
+          event.liveSlots ?? null,
+        ])
       rows += 1
     } else if (event.kind === 'turbo_task') {
       await database
@@ -147,7 +154,13 @@ export async function ingestRun(database: Ledger, runId: string): Promise<number
           `INSERT INTO turbo_tasks (run_id, package_name, task, duration_ms, cache_status)
            VALUES (?,?,?,?,?)`,
         )
-        .run([runId, event.packageName, event.task, event.durationMs, event.cacheStatus])
+        .run([
+          runId,
+          event.packageName ?? null,
+          event.task ?? null,
+          event.durationMs ?? null,
+          event.cacheStatus ?? null,
+        ])
       rows += 1
     } else if (event.kind === 'file') {
       await database

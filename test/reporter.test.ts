@@ -161,6 +161,27 @@ describe('the ledger reporter', () => {
     expect(() => readdirSync(path.join(directory, 'runs'))).toThrow()
   })
 
+  /**
+   * Everything after construction is wrapped in the reporter's own
+   * never-fail guarantee, but the constructor itself runs before that
+   * guarantee applies. A hand-written Vitest config that forgets reporter
+   * options entirely (or passes an empty object) must not throw at Vitest
+   * startup.
+   */
+  it('tolerates a missing or empty options object', async () => {
+    const reporter = new TestLedgerReporter()
+
+    await reporter.onTestModuleEnd(
+      fakeModule({
+        moduleId: '/abs/f.test.ts',
+        tests: [{ fullName: 'f > works', state: 'passed', duration: 1, startTime: 1 }],
+      }) as never,
+    )
+
+    const file = readEvents('run-1').find((event) => event['kind'] === 'file')
+    expect(file).toMatchObject({ lane: 'unknown', packageName: 'unknown' })
+  })
+
   it('mints its own run id when the envelope is absent', async () => {
     delete process.env['TEST_LEDGER_RUN_ID']
     const reporter = new TestLedgerReporter({ lane: 'unit', packageName: '@repo/db' })

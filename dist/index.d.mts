@@ -26,7 +26,13 @@ declare const runDir: (runId: string) => string
 /** Per-process, so concurrent writers never share a file handle or a lock. */
 declare const eventsPath: (runId: string, pid: number) => string
 declare const databasePath: () => string
-/** Held by `ingest` so concurrent runs cannot write the database at once. */
+/**
+ * Reserved for when ingest becomes automated (phase 2 wiring it into the
+ * test-selection harness). Nothing acquires this lock today: concurrent
+ * `ingest` invocations are currently unguarded, and the path exists so the
+ * automated caller has somewhere to acquire it without a later schema/path
+ * change.
+ */
 declare const ingestLockPath: () => string
 //#endregion
 //#region src/failure-class.d.ts
@@ -170,6 +176,7 @@ type FlakyRow = {
   runs: number
   failures: number
   failureRate: number
+  retries: number
   classes: string
 }
 /**
@@ -181,6 +188,13 @@ type FlakyRow = {
  * aggregated into the row because the class is what separates a genuine flake
  * from a host-capacity artifact: a test failing only as `timeout` under load is
  * a different problem from one failing as `assertion`.
+ *
+ * A test surfaces if it either failed outright, or passed only after a retry:
+ * Vitest's own retry mechanism means a test that failed then passed on retry
+ * records `state = 'passed'` with `retry_count > 0`, so `failures > 0` alone
+ * would miss it even though it is exactly the kind of instability this report
+ * exists to surface. `retries` counts the runs in which this test needed at
+ * least one retry, alongside the run/failure counts.
  */
 declare function flakyReport(
   database: Ledger,
@@ -198,11 +212,17 @@ type SlowRow = {
   shareOfTotal: number
 }
 /**
- * Ranks files by total wall-clock, with each file's share of the whole.
+ * Ranks files by summed duration, with each file's share of the column total.
  *
  * Share rather than raw duration is the ranking that answers "what would
  * cutting this actually buy": a 3s file run on every branch costs more than a
  * 40s file run once a week, and only the share makes that visible.
+ *
+ * `shareOfTotal` is share of `SUM(duration_ms)` **summed across every file
+ * row** — not of the run's wall-clock. A `pnpm test` invocation fans out to
+ * roughly two dozen parallel Vitest processes, so the denominator here is on
+ * the order of 24x wall-clock; a file reading `shareOfTotal: 0.09` did not
+ * cost 9% of the run's actual duration, only 9% of the summed per-file time.
  */
 declare function slowReport(
   database: Ledger,
@@ -253,6 +273,9 @@ type ShapeRow = {
   totalMs: number
   setupMs: number
   environmentSetupMs: number
+  turboTasks: number
+  turboCacheHits: number
+  turboCacheMisses: number
 }
 /**
  * Where a run's time goes, split by package and lane, with the environment and
@@ -261,6 +284,13 @@ type ShapeRow = {
  * The environment column is the one worth watching: it is what turns "jsdom
  * costs us something" from a number someone measured once by hand into a
  * standing figure.
+ *
+ * `turboTasks` / `turboCacheHits` / `turboCacheMisses` come from `turbo_tasks`,
+ * joined in by package only: Turbo's cache is a per-package/per-task concept
+ * with no lane of its own, so every lane row for a package repeats the same
+ * three figures rather than splitting them. A cache miss is any status other
+ * than `HIT` (`MISS`, `UNKNOWN`, ...), read as "this task actually ran" rather
+ * than "this task was served from cache."
  */
 declare function shapeReport(database: Ledger): Promise<ShapeRow[]>
 //#endregion

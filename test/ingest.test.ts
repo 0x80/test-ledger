@@ -144,6 +144,27 @@ describe('ingest', () => {
     expect(runs[0]).toMatchObject({ has_envelope: 0 })
   })
 
+  /**
+   * `isLedgerEvent` validates only `kind` and `runId`, so a truncated-but-
+   * parseable `sample` line missing `at` (or any other field) must not abort
+   * ingest of the rest of the run — it must bind `null`, the same as the
+   * `file` and `test` branches already do.
+   */
+  it('does not abort ingest when a sample event is missing a field', async () => {
+    writeRun('r1', [
+      { kind: 'sample', runId: 'r1' },
+      { kind: 'turbo_task', runId: 'r1' },
+      { kind: 'test', runId: 'r1', file: '/a.ts', fullName: 'x', state: 'passed' },
+    ])
+
+    const database = await openLedger()
+
+    await expect(ingestRun(database, 'r1')).resolves.toBeGreaterThan(0)
+    expect(await database.prepare('SELECT * FROM run_samples').all()).toHaveLength(1)
+    expect(await database.prepare('SELECT * FROM turbo_tasks').all()).toHaveLength(1)
+    expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(1)
+  })
+
   it('ingests every un-ingested run', async () => {
     writeRun('r1', [{ kind: 'test', runId: 'r1', file: '/a.ts', fullName: 'x', state: 'passed' }])
     writeRun('r2', [{ kind: 'test', runId: 'r2', file: '/b.ts', fullName: 'y', state: 'failed' }])

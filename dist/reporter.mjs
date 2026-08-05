@@ -1,4 +1,4 @@
-import { a as runDir, n as eventsPath } from './paths-BtOSn20v.mjs'
+import { a as runDir, n as eventsPath } from './paths-BfgS-0Zu.mjs'
 import { n as classifyFailure, t as mintRunId } from './run-id-DJVHgJq8.mjs'
 import { appendFile, mkdir } from 'node:fs/promises'
 
@@ -25,6 +25,12 @@ var TestLedgerReporter = class {
    */
   #disabled = false
   #directoryReady = false
+  /**
+   * `options` is optional and each field defaults defensively: everything
+   * after construction is wrapped in the same "never fail the run" guarantee,
+   * and a hand-written Vitest config that forgets to pass reporter options (or
+   * passes an empty object) must not throw at Vitest startup either.
+   */
   constructor(options) {
     /**
      * An escape hatch that must exist before anyone needs it: if the ledger
@@ -32,8 +38,8 @@ var TestLedgerReporter = class {
      * path without editing a shared config every worktree depends on.
      */
     if (process.env['TEST_LEDGER_DISABLED'] === '1') this.#disabled = true
-    this.#lane = options.lane
-    this.#packageName = options.packageName
+    this.#lane = options?.lane ?? 'unknown'
+    this.#packageName = options?.packageName ?? 'unknown'
     /**
      * An ad-hoc `pnpm --filter x test` runs outside the budget wrapper and so
      * has no envelope. Minting an id here means that run is still recorded

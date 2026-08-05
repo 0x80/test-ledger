@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { flakyReport } from '../src/reports/flaky.ts'
+import { shapeReport } from '../src/reports/shape.ts'
 import { slowReport } from '../src/reports/slow.ts'
 import { ingestAll } from '../src/store/ingest.ts'
 import { openLedger } from '../src/store/open.ts'
@@ -156,5 +157,69 @@ describe('reports', () => {
 
     expect(rows[0]).toMatchObject({ file: '/slow.ts', totalMs: 900 })
     expect(rows[0]?.shareOfTotal).toBeCloseTo(0.9)
+  })
+
+  /**
+   * A test that failed then passed on retry must still surface: `failures`
+   * alone would miss it because its final recorded state is 'passed', even
+   * though `retry_count > 0` marks it as unstable.
+   */
+  it('surfaces a test that passed only after a retry', async () => {
+    writeRun('r1', [
+      {
+        kind: 'test',
+        runId: 'r1',
+        file: '/e.test.ts',
+        fullName: 'e > retried',
+        state: 'passed',
+        retryCount: 1,
+      },
+    ])
+    writeRun('r2', [
+      {
+        kind: 'test',
+        runId: 'r2',
+        file: '/e.test.ts',
+        fullName: 'e > retried',
+        state: 'passed',
+        retryCount: 0,
+      },
+    ])
+
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await flakyReport(database, { minRuns: 2 })
+    const row = rows.find((candidate) => candidate.fullName === 'e > retried')
+
+    expect(row).toMatchObject({ runs: 2, failures: 0, retries: 1 })
+  })
+
+  /** Turbo cache-status counts land in `shape`, joined in by package only. */
+  it('reports turbo task cache-hit and cache-miss counts by package', async () => {
+    writeRun('r1', [
+      { kind: 'file', runId: 'r1', file: '/a.test.ts', lane: 'unit', packageName: '@repo/db' },
+      {
+        kind: 'turbo_task',
+        runId: 'r1',
+        packageName: '@repo/db',
+        task: 'test',
+        cacheStatus: 'HIT',
+      },
+      {
+        kind: 'turbo_task',
+        runId: 'r1',
+        packageName: '@repo/db',
+        task: 'build',
+        cacheStatus: 'MISS',
+      },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const rows = await shapeReport(database)
+    const row = rows.find((candidate) => candidate.packageName === '@repo/db')
+
+    expect(row).toMatchObject({ turboTasks: 2, turboCacheHits: 1, turboCacheMisses: 1 })
   })
 })

@@ -28,9 +28,18 @@ CREATE TABLE IF NOT EXISTS runs (
   has_envelope INTEGER NOT NULL DEFAULT 0
 );
 
+/**
+ * No primary key: an append-only time series, and neither \`at\` nor any other
+ * column is needed to make a row unique, so none but \`run_id\` is NOT NULL.
+ * \`isLedgerEvent\` validates only \`kind\` and \`runId\` before ingest ever sees a
+ * row, so a truncated-but-parseable \`sample\` line legitimately reaches this
+ * insert missing \`at\`; a NOT NULL constraint there would turn one malformed
+ * telemetry line into a thrown error that aborts ingest of the rest of the
+ * run, which is the trade this table is designed to avoid.
+ */
 CREATE TABLE IF NOT EXISTS run_samples (
   run_id TEXT NOT NULL,
-  at INTEGER NOT NULL,
+  at INTEGER,
   load1 REAL,
   load5 REAL,
   free_memory_bytes INTEGER,
@@ -38,10 +47,11 @@ CREATE TABLE IF NOT EXISTS run_samples (
 );
 CREATE INDEX IF NOT EXISTS run_samples_run_at ON run_samples (run_id, at);
 
+/** Same reasoning as \`run_samples\`: no primary key, so only \`run_id\` is NOT NULL. */
 CREATE TABLE IF NOT EXISTS turbo_tasks (
   run_id TEXT NOT NULL,
-  package_name TEXT NOT NULL,
-  task TEXT NOT NULL,
+  package_name TEXT,
+  task TEXT,
   duration_ms INTEGER,
   cache_status TEXT
 );
