@@ -2,7 +2,7 @@
 import { defineConfig } from 'tsdown'
 
 export default defineConfig({
-  entry: ['src/cli.ts', 'src/reporter.ts', 'src/index.ts'],
+  entry: ['src/cli.ts', 'src/reporter.ts', 'src/index.ts', 'src/collector.ts'],
   format: 'esm',
   target: 'node24',
   outDir: 'dist',

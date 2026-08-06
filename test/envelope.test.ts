@@ -80,4 +80,22 @@ describe('the run envelope', () => {
     const distinctTimestamps = new Set(samples.map((sample) => sample['at']))
     expect(distinctTimestamps.size).toBeGreaterThan(1)
   })
+
+  it('never throws when liveSlots() throws, and still writes the sample', () => {
+    const liveSlots = (): number => {
+      throw new Error('slot directory vanished')
+    }
+
+    let stop: () => void = () => {}
+    expect(() => {
+      stop = startSampler('r3', { intervalMs: 10, liveSlots })
+    }).not.toThrow()
+    expect(() => {
+      stop()
+    }).not.toThrow()
+
+    const samples = readAll('r3').filter((event) => event['kind'] === 'sample')
+    expect(samples.length).toBeGreaterThanOrEqual(2)
+    expect(samples[0]).toMatchObject({ liveSlots: 0 })
+  })
 })

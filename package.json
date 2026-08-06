@@ -27,6 +27,10 @@
     "./reporter": {
       "types": "./dist/reporter.d.mts",
       "default": "./dist/reporter.mjs"
+    },
+    "./collector": {
+      "types": "./dist/collector.d.mts",
+      "default": "./dist/collector.mjs"
     }
   },
   "scripts": {

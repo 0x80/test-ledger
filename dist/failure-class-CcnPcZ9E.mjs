@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto'
-
 //#region src/failure-class.ts
 /**
  * Ordered most specific first. The order is the behavior: `hook_timeout` and
@@ -36,18 +34,4 @@ function classifyFailure(error) {
 }
 
 //#endregion
-//#region src/run-id.ts
-/**
- * A fresh 128-bit id per run.
- *
- * Unlike `review-ledger`, which derives its run id from ledger identity so a
- * republish is idempotent, a test run has no natural key: the same branch on
- * the same machine is run over and over, and each of those IS a distinct run.
- * Random is therefore correct here, not merely convenient.
- */
-function mintRunId() {
-  return randomUUID().replaceAll('-', '')
-}
-
-//#endregion
-export { classifyFailure as n, mintRunId as t }
+export { classifyFailure as t }

@@ -22,17 +22,36 @@ export function startSampler(runId: string, options: SamplerOptions): () => void
   const intervalMs = options.intervalMs ?? 5000
 
   const write = (): void => {
-    const [load1 = 0, load5 = 0] = loadavg()
-    const event: SampleEvent = {
-      kind: 'sample',
-      runId,
-      at: Date.now(),
-      load1,
-      load5,
-      freeMemoryBytes: freemem(),
-      liveSlots: options.liveSlots(),
+    /**
+     * The whole body is guarded, not just `appendEvents` below: `liveSlots()`
+     * runs before `appendEvents` is ever reached, so a throw inside it (the
+     * monorepo's callback calls `readdirSync` on a slot directory that can
+     * vanish mid-run) must not escape here either. A failing `liveSlots()`
+     * degrades to an unknown count rather than losing the sample entirely —
+     * `load1`/`load5`/free memory are still worth recording on their own.
+     */
+    try {
+      let liveSlots = 0
+      try {
+        liveSlots = options.liveSlots()
+      } catch {
+        /** Degrade to an unknown slot count; the rest of the sample still lands. */
+      }
+
+      const [load1 = 0, load5 = 0] = loadavg()
+      const event: SampleEvent = {
+        kind: 'sample',
+        runId,
+        at: Date.now(),
+        load1,
+        load5,
+        freeMemoryBytes: freemem(),
+        liveSlots,
+      }
+      appendEvents(runId, process.pid, [event])
+    } catch {
+      /** Deliberately silent: telemetry must never fail the run it measures. */
     }
-    appendEvents(runId, process.pid, [event])
   }
 
   write()
