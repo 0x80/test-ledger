@@ -152,16 +152,21 @@ prevent:
   directory, a full disk) the reporter latches itself disabled for the rest of the run rather than
   retrying. A telemetry package that can fail the test run it's instrumenting is worse than no
   telemetry at all.
-- **Ingest is idempotent.** Each run directory is folded in at most once, tracked in the database's
-  `ingested_runs` table; re-running `ingest` against an already-folded run is a no-op, not a
-  duplicate insert. A run's whole fold — every table plus that marker — commits as one transaction,
-  so an interrupted ingest leaves nothing behind for the retry to duplicate. This matters most for
-  `run_samples` and `turbo_tasks`, which are append-only with no per-row key and so have no
-  convergence of their own.
+- **Ingest is idempotent, by two mechanisms that cover different cases.** The `ingested_runs` marker
+  is what makes a _completed_ run a no-op on a later re-ingest. The fact that a run's whole fold —
+  every table plus that marker — commits as one transaction is what makes an _interrupted_ run safe,
+  by leaving nothing behind for the retry to duplicate. Both matter because `run_samples` and
+  `turbo_tasks` are append-only with no per-row key, so unlike the other four tables they have no
+  convergence of their own and would simply append a second copy.
 - **Ingest is serialized by a lock.** `test-ledger ingest` holds `ingest.lock` in the ledger
   directory for the whole fold, taken before the database file is opened — the driver locks that
   file exclusively at open, so without it a second concurrent invocation would die on the file
-  rather than queue. A lock left behind by a killed process is reclaimed after ten minutes.
+  rather than queue. A lock is reclaimed only once it is both older than ten minutes _and_ its
+  recorded holder is no longer running, so a genuine hours-long backlog ingest is never reclaimed
+  out from under itself.
+- **Ingest collapses the WAL when it finishes.** Without that the write-ahead log only grows; a
+  999-run backlog folded through the old row-at-a-time path left a 41 GB WAL beside a 1.4 GB
+  database. The same backlog through the batched path is about 1.6 GB total.
 - **NDJSON is the durable raw form.** The SQLite database is a derived view, always rebuildable
   from the retained NDJSON. Nothing about this package's design should ever make the NDJSON files
   disposable ahead of the database that was built from them — a future re-ingest into a different

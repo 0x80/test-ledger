@@ -111,19 +111,28 @@ async function insertRows(
 }
 
 /**
- * Runs `fn` inside one transaction, rolling back if it throws.
+ * Runs `fn` inside one `IMMEDIATE` transaction, rolling back if anything throws.
  *
- * Spelled out with `exec` rather than the driver's own `transaction()` helper
- * so the mode is explicit: `IMMEDIATE` takes the write lock at `BEGIN` instead
- * of on the first write, which turns a concurrent writer into an immediate
- * failure rather than one discovered halfway through a fold.
+ * `IMMEDIATE` takes the write lock at `BEGIN` rather than on the first write, so
+ * a concurrent writer fails immediately instead of halfway through a fold. The
+ * driver's own `transaction()` helper does expose an immediate variant, but only
+ * as a property on the returned function that its type declarations don't
+ * describe (`transaction(fn)` is typed as returning a plain
+ * `(...args: any[]) => Promise<any>`), so reaching it would mean asserting
+ * through the types and taking `any` back. Spelling the three statements out
+ * keeps the mode explicit and the whole path typed.
+ *
+ * The commit is inside the `try` on purpose: a `COMMIT` that fails leaves the
+ * transaction open, and on a connection that outlives this call — every caller's
+ * does — the next fold would then begin inside the failed one's transaction.
  */
 async function inTransaction<T>(database: Ledger, fn: () => Promise<T>): Promise<T> {
   await database.exec('BEGIN IMMEDIATE')
 
-  let result: T
   try {
-    result = await fn()
+    const result = await fn()
+    await database.exec('COMMIT')
+    return result
   } catch (error) {
     try {
       await database.exec('ROLLBACK')
@@ -136,9 +145,6 @@ async function inTransaction<T>(database: Ledger, fn: () => Promise<T>): Promise
     }
     throw error
   }
-
-  await database.exec('COMMIT')
-  return result
 }
 
 const RUN_COLUMNS = [
@@ -220,10 +226,14 @@ const TEST_COLUMNS = [
  * Committing the marker with the rows it describes removes that window: either
  * both are there, or neither is.
  *
- * The short-circuit on `ingested_runs` remains, now purely as an optimization —
- * it saves reading and folding a run directory already known to be complete. The
- * per-row upserts on `runs`, `files`, and `tests` remain too, because within a
- * single fold they are what makes a re-ingest converge rather than conflict.
+ * The two mechanisms cover different cases and neither replaces the other. The
+ * `ingested_runs` short-circuit is what makes a *completed* run idempotent on a
+ * later re-ingest: `run_samples` and `turbo_tasks` would happily append a second
+ * copy of every row, since they have no key to conflict on. The transaction is
+ * what makes an *interrupted* run idempotent, by ensuring a fold that never
+ * finished left nothing for the retry to duplicate. The per-row upserts on
+ * `runs`, `files`, and `tests` remain too, because within a single fold they are
+ * what makes a re-ingest converge rather than conflict.
  * `INSERT OR REPLACE` was the natural spelling for that, but the installed
  * `@tursodatabase/database@0.3.2` engine rejects it at prepare time with "is
  * only supported with UPSERT", so the upsert form is used instead; it is the
@@ -306,7 +316,12 @@ export async function ingestRun(database: Ledger, runId: string): Promise<number
         event.skipped ?? null,
       ])
     } else if (event.kind === 'test') {
-      /** NUL separates the two parts: it can appear in neither a path nor a test name. */
+      /**
+       * NUL separates the two parts. A path cannot contain one, which is what
+       * makes the split unambiguous — a test name is an unrestricted JavaScript
+       * string and may contain anything, including NUL, but it only ever sits
+       * after the separator.
+       */
       testRows.set(`${event.file}\u0000${event.fullName}`, [
         runId,
         event.pid ?? null,
@@ -401,8 +416,48 @@ export async function ingestAll(database: Ledger): Promise<IngestResult> {
 }
 
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run, and
- * closes again. The entry point for the CLI and for any automated caller.
+ * Closes the ledger without letting the close itself change the outcome.
+ *
+ * Once the fold has committed, its rows are durable, so a failure to close is
+ * not a failure to ingest — reporting one would call a successful run broken.
+ * And when the fold already threw, that error is the one describing what went
+ * wrong; a close failure must not displace it.
+ */
+async function closeQuietly(database: Ledger): Promise<void> {
+  try {
+    await database.close()
+  } catch {
+    /** Nothing actionable here: the fold's own outcome is the answer. */
+  }
+}
+
+/**
+ * Collapses the write-ahead log back into the database file after a fold.
+ *
+ * Left alone, the WAL only grows: a 999-run backlog folded through the previous
+ * row-at-a-time path produced a 41 GB WAL beside a 1.4 GB database, roughly ten
+ * times the whole ledger in write amplification that no reader ever needed.
+ * `TRUNCATE` returns the space rather than merely marking it reusable.
+ *
+ * Deliberately `exec` and not `.all()`: the installed
+ * `@tursodatabase/database@0.3.2` bindings panic outright (a Rust
+ * index-out-of-bounds in `bindings/javascript/src/lib.rs`, which takes the
+ * process down rather than throwing) when asked to hand back this pragma's
+ * result row. `exec` and `.run()` both execute it without reading rows and were
+ * confirmed safe by hand against that version.
+ */
+async function checkpointQuietly(database: Ledger): Promise<void> {
+  try {
+    await database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  } catch {
+    /** Best effort: a WAL that did not collapse costs disk, not correctness. */
+  }
+}
+
+/**
+ * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * collapses the WAL, and closes again. The entry point for the CLI and for any
+ * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
@@ -413,11 +468,19 @@ export async function ingestAll(database: Ledger): Promise<IngestResult> {
 export async function ingest(): Promise<IngestResult> {
   const result = await withIngestLock(async () => {
     const database = await openLedger()
+
+    let folded: IngestResult
     try {
-      return await foldUnIngestedRuns(database)
-    } finally {
-      await database.close()
+      folded = await foldUnIngestedRuns(database)
+    } catch (error) {
+      await closeQuietly(database)
+      throw error
     }
+
+    await checkpointQuietly(database)
+    await closeQuietly(database)
+
+    return folded
   })
 
   return result

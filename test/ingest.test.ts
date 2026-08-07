@@ -271,15 +271,39 @@ describe('ingest', () => {
 
     const completed: string[] = []
 
+    /**
+     * Two barriers rather than a sleep race: `acquired` guarantees the holder
+     * owns the lock before `ingest()` is even called, and `letGo` decides when
+     * it releases. Starting both concurrently and hoping the holder wins would
+     * make the ordering assertion below a coin flip under load.
+     */
+    let signalAcquired: () => void = () => undefined
+    const acquired = new Promise<void>((resolve) => {
+      signalAcquired = resolve
+    })
+    let letGo: () => void = () => undefined
+    const held = new Promise<void>((resolve) => {
+      letGo = resolve
+    })
+
     const holder = withIngestLock(async () => {
-      await sleep(300)
+      signalAcquired()
+      await held
       completed.push('holder')
     })
+
+    await acquired
+
     const sweep = ingest().then((result) => {
       completed.push('ingest')
       return result
     })
 
+    /** With the lock genuinely held, the sweep must not have progressed. */
+    await sleep(150)
+    expect(completed).toEqual([])
+
+    letGo()
     const [, result] = await Promise.all([holder, sweep])
 
     expect(completed).toEqual(['holder', 'ingest'])
@@ -287,5 +311,50 @@ describe('ingest', () => {
 
     const database = await openLedger()
     expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(1)
+  })
+
+  /**
+   * The batching loop only does anything past `MAX_BOUND_PARAMETERS`, and every
+   * other fixture here is a handful of rows — so without this the chunk boundary
+   * that the whole performance change rests on is never crossed by a test.
+   *
+   * `run_samples` binds 6 columns and `tests` binds 10, so at a 4000-parameter
+   * budget these counts span three and three chunks respectively, exercising
+   * both the full-chunk and the short-remainder statement shapes.
+   */
+  it('folds correctly across chunk boundaries', async () => {
+    const events: Record<string, unknown>[] = []
+    for (let index = 0; index < 1500; index += 1) {
+      events.push({ kind: 'sample', runId: 'big', at: index, load1: index / 100, load5: 0.4 })
+    }
+    for (let index = 0; index < 1000; index += 1) {
+      events.push({
+        kind: 'test',
+        runId: 'big',
+        file: '/a.test.ts',
+        fullName: `case ${index}`,
+        state: 'passed',
+        durationMs: index,
+      })
+    }
+    writeRun('big', events)
+
+    const database = await openLedger()
+    const rows = await ingestRun(database, 'big')
+
+    expect(rows).toBe(2500)
+    expect(await database.prepare('SELECT * FROM run_samples').all()).toHaveLength(1500)
+    expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(1000)
+
+    /** Rows either side of a boundary, not just the aggregate count. */
+    const boundary = await database
+      .prepare('SELECT at FROM run_samples WHERE at IN (?,?,?) ORDER BY at')
+      .all([665, 666, 667])
+    expect(boundary).toEqual([{ at: 665 }, { at: 666 }, { at: 667 }])
+
+    const lastTest = await database
+      .prepare('SELECT duration_ms FROM tests WHERE full_name = ?')
+      .all(['case 999'])
+    expect(lastTest).toEqual([{ duration_ms: 999 }])
   })
 })

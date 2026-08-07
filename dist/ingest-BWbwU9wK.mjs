@@ -263,20 +263,21 @@ function isLedgerEvent(value) {
  * How long to keep retrying before giving up on a held lock.
  *
  * Sized against a worst-case ingest, not a typical one: a batched fold of a
- * full-suite run is a few seconds, so a minute of waiting means the holder is
- * doing something far larger (a first ingest of a long backlog) rather than
- * merely being slow.
+ * full-suite run is well under a second, so a minute of waiting means the
+ * holder is doing something far larger (a first ingest of a long backlog)
+ * rather than merely being slow.
  */
 const ACQUIRE_TIMEOUT_MS = 6e4
 const RETRY_INTERVAL_MS = 100
 /**
- * A lock file older than this is treated as abandoned and reclaimed.
+ * A lock file older than this *may* be reclaimed — but only once its holder is
+ * also shown to be gone (see {@link holderIsAlive}).
  *
- * A process killed with `SIGKILL` never runs its release, so without this a
- * single hard kill would wedge every later ingest permanently. The window is
- * deliberately far wider than any real ingest: reclaiming a lock a live writer
- * still holds is the worse failure, and the release path already handles the
- * common crash cases.
+ * A process killed with `SIGKILL` never runs its release, so without
+ * reclamation a single hard kill would wedge every later ingest on the machine
+ * permanently. Age alone is deliberately not sufficient: a first ingest of a
+ * long backlog legitimately runs for hours, and reclaiming the lock out from
+ * under a live one is the worse failure of the two.
  */
 const STALE_AFTER_MS = 600 * 1e3
 async function sleep(ms) {
@@ -307,22 +308,81 @@ async function readLockFile(path$1) {
   }
 }
 /**
- * Removes a lock file whose mtime is older than {@link STALE_AFTER_MS}.
+ * Whether the recorded holder is still running.
  *
- * Returns whether anything was removed, so the caller can retry immediately
- * rather than sleeping out another interval. Two processes can reach this at
- * once; both may unlink, and the exclusive create that follows is what decides
- * which of them actually takes the lock.
+ * Only answerable for a lock taken on this host — a pid from another machine
+ * says nothing about a local process table — so a foreign lock reports `false`
+ * and is reclaimable on age alone, which is the best available answer when the
+ * ledger directory is shared.
+ *
+ * `process.kill(pid, 0)` sends no signal; it only asks whether the pid is
+ * addressable. `EPERM` means the process exists but belongs to another user,
+ * which still counts as alive.
+ *
+ * Pid reuse is the known imprecision: if the holder died and an unrelated
+ * process inherited its pid, this reports alive and the lock is never
+ * reclaimed, so acquisition fails with the timeout message naming that pid
+ * instead. That is the safe direction to be wrong in — a stuck ingest the user
+ * can diagnose beats two ingests that both believe they hold the lock.
+ */
+function holderIsAlive(holder) {
+  if (holder === void 0 || holder.pid <= 0) return false
+  if (holder.host !== hostname()) return false
+  try {
+    process.kill(holder.pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+/**
+ * Removes a lock file that is both older than {@link STALE_AFTER_MS} and whose
+ * holder is no longer running. Returns whether the caller should retry the
+ * exclusive create immediately rather than sleeping out another interval.
+ *
+ * **This is not an atomic take-over, and does not claim to be.** Between the
+ * `stat` that finds the lock stale and the `rm` that removes it, the original
+ * holder could in principle release and a successor acquire, and this would
+ * then delete the successor's fresh lock. Re-reading the token immediately
+ * before removing narrows that window to the gap between the two calls, but
+ * does not close it — closing it needs an OS advisory lock (`flock`/`fcntl`),
+ * which Node does not expose without a native dependency.
+ *
+ * The residual race is tolerated because its cost here is bounded and visible.
+ * Reaching it requires a lock left by a dead process, two ingests racing to
+ * reclaim it within the same instant, and a third acquiring in between. The
+ * outcome is not a corrupt ledger: `ingest()` takes this lock *before* opening
+ * the database, so two processes that both believed they held it collide on the
+ * driver's own exclusive lock on `ledger.db` and one dies with "File is locked
+ * by another process" — a crash the user retries, which is also exactly what
+ * every ingest did before this lock existed.
  */
 async function reclaimIfStale(path$1) {
   let modifiedAt
   try {
     modifiedAt = (await stat(path$1)).mtimeMs
-  } catch {
-    /** Released between the failed create and this check: retry immediately. */
-    return true
+  } catch (error) {
+    if (error.code === 'ENOENT')
+      /** Released between the failed create and this check: retry immediately. */
+      return true
+    /**
+     * Anything else (`EACCES`, `EIO`, ...) is a real filesystem failure. It must
+     * propagate rather than read as "the lock vanished": treating it as a
+     * disappearance returns the caller to the top of its retry loop, where a
+     * persistent error would spin without ever sleeping or reaching the
+     * deadline.
+     */
+    throw error
   }
   if (Date.now() - modifiedAt < STALE_AFTER_MS) return false
+  const holder = await readLockFile(path$1)
+  if (holderIsAlive(holder)) return false
+  /**
+   * Re-read immediately before removing, so a lock replaced since the `stat`
+   * above is left alone. Narrowing, not a guarantee — see the docblock.
+   */
+  const stillTheSameHolder = await readLockFile(path$1)
+  if (holder !== void 0 && stillTheSameHolder?.token !== holder.token) return false
   await rm(path$1, { force: true })
   return true
 }
@@ -332,9 +392,10 @@ async function reclaimIfStale(path$1) {
  * The lock is a file created with the exclusive `wx` flag, which is atomic on
  * every filesystem we care about, so two invocations racing to create it always
  * produce exactly one winner. It carries a random token identifying its holder;
- * release only removes the file when the token still matches, so a process
- * whose lock was reclaimed as stale cannot delete its successor's lock on the
- * way out.
+ * release only removes the file when that token still matches, so a process
+ * whose lock was reclaimed as stale does not delete its successor's on the way
+ * out. (Read alongside {@link reclaimIfStale}, which is candid about the one
+ * window neither mechanism closes.)
  *
  * Held for the whole fold rather than per statement: the thing being made
  * mutually exclusive is one ingest against another, and a per-statement lock
@@ -346,9 +407,11 @@ async function withIngestLock(fn) {
   const token = crypto.randomUUID()
   mkdirSync(ledgerDir(), { recursive: true })
   const deadline = Date.now() + ACQUIRE_TIMEOUT_MS
-  for (;;)
+  for (;;) {
+    let acquired = false
     try {
       const handle = await open(path$1, 'wx')
+      acquired = true
       try {
         const contents = {
           token,
@@ -357,23 +420,39 @@ async function withIngestLock(fn) {
           acquiredAt: Date.now(),
         }
         await handle.writeFile(JSON.stringify(contents))
-      } finally {
         await handle.close()
+      } catch (error) {
+        /**
+         * The exclusive create succeeded, so this process owns the file even
+         * though it failed to describe itself in it. Leaving it behind would
+         * block every later ingest until the staleness window expired, over a
+         * failure that has nothing to do with contention.
+         */
+        try {
+          await handle.close()
+        } catch {}
+        await rm(path$1, { force: true })
+        throw error
       }
       break
     } catch (error) {
+      if (acquired) throw error
       if (error.code !== 'EEXIST') throw error
-      if (!(await reclaimIfStale(path$1))) {
-        if (Date.now() >= deadline) {
-          const holder = await readLockFile(path$1)
-          throw new Error(
-            `test-ledger ingest lock at ${path$1} is held by pid ${holder?.pid ?? 'unknown'} on ${holder?.host ?? 'unknown'}; gave up after ${ACQUIRE_TIMEOUT_MS}ms`,
-            { cause: error },
-          )
-        }
-        await sleep(RETRY_INTERVAL_MS)
+      /**
+       * Checked before the reclaim attempt, so it bounds every path through
+       * this loop. Checking it only on the contended branch let a lock that
+       * kept appearing and disappearing spin without a ceiling.
+       */
+      if (Date.now() >= deadline) {
+        const holder = await readLockFile(path$1)
+        throw new Error(
+          `test-ledger ingest lock at ${path$1} is held by pid ${holder?.pid ?? 'unknown'} on ${holder?.host ?? 'unknown'}; gave up after ${ACQUIRE_TIMEOUT_MS}ms`,
+          { cause: error },
+        )
       }
+      if (!(await reclaimIfStale(path$1))) await sleep(RETRY_INTERVAL_MS)
     }
+  }
   try {
     return await fn()
   } finally {
@@ -593,26 +672,33 @@ async function insertRows(database, table$1, columns, rows, onConflict = '') {
   }
 }
 /**
- * Runs `fn` inside one transaction, rolling back if it throws.
+ * Runs `fn` inside one `IMMEDIATE` transaction, rolling back if anything throws.
  *
- * Spelled out with `exec` rather than the driver's own `transaction()` helper
- * so the mode is explicit: `IMMEDIATE` takes the write lock at `BEGIN` instead
- * of on the first write, which turns a concurrent writer into an immediate
- * failure rather than one discovered halfway through a fold.
+ * `IMMEDIATE` takes the write lock at `BEGIN` rather than on the first write, so
+ * a concurrent writer fails immediately instead of halfway through a fold. The
+ * driver's own `transaction()` helper does expose an immediate variant, but only
+ * as a property on the returned function that its type declarations don't
+ * describe (`transaction(fn)` is typed as returning a plain
+ * `(...args: any[]) => Promise<any>`), so reaching it would mean asserting
+ * through the types and taking `any` back. Spelling the three statements out
+ * keeps the mode explicit and the whole path typed.
+ *
+ * The commit is inside the `try` on purpose: a `COMMIT` that fails leaves the
+ * transaction open, and on a connection that outlives this call — every caller's
+ * does — the next fold would then begin inside the failed one's transaction.
  */
 async function inTransaction(database, fn) {
   await database.exec('BEGIN IMMEDIATE')
-  let result
   try {
-    result = await fn()
+    const result = await fn()
+    await database.exec('COMMIT')
+    return result
   } catch (error) {
     try {
       await database.exec('ROLLBACK')
     } catch {}
     throw error
   }
-  await database.exec('COMMIT')
-  return result
 }
 const RUN_COLUMNS = [
   'run_id',
@@ -675,10 +761,14 @@ const TEST_COLUMNS = [
  * Committing the marker with the rows it describes removes that window: either
  * both are there, or neither is.
  *
- * The short-circuit on `ingested_runs` remains, now purely as an optimization —
- * it saves reading and folding a run directory already known to be complete. The
- * per-row upserts on `runs`, `files`, and `tests` remain too, because within a
- * single fold they are what makes a re-ingest converge rather than conflict.
+ * The two mechanisms cover different cases and neither replaces the other. The
+ * `ingested_runs` short-circuit is what makes a *completed* run idempotent on a
+ * later re-ingest: `run_samples` and `turbo_tasks` would happily append a second
+ * copy of every row, since they have no key to conflict on. The transaction is
+ * what makes an *interrupted* run idempotent, by ensuring a fold that never
+ * finished left nothing for the retry to duplicate. The per-row upserts on
+ * `runs`, `files`, and `tests` remain too, because within a single fold they are
+ * what makes a re-ingest converge rather than conflict.
  * `INSERT OR REPLACE` was the natural spelling for that, but the installed
  * `@tursodatabase/database@0.3.2` engine rejects it at prepare time with "is
  * only supported with UPSERT", so the upsert form is used instead; it is the
@@ -756,7 +846,12 @@ async function ingestRun(database, runId) {
         event.skipped ?? null,
       ])
     else if (event.kind === 'test')
-      /** NUL separates the two parts: it can appear in neither a path nor a test name. */
+      /**
+       * NUL separates the two parts. A path cannot contain one, which is what
+       * makes the split unambiguous — a test name is an unrestricted JavaScript
+       * string and may contain anything, including NUL, but it only ever sits
+       * after the separator.
+       */
       testRows.set(`${event.file}\u0000${event.fullName}`, [
         runId,
         event.pid ?? null,
@@ -838,8 +933,42 @@ async function ingestAll(database) {
   })
 }
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run, and
- * closes again. The entry point for the CLI and for any automated caller.
+ * Closes the ledger without letting the close itself change the outcome.
+ *
+ * Once the fold has committed, its rows are durable, so a failure to close is
+ * not a failure to ingest — reporting one would call a successful run broken.
+ * And when the fold already threw, that error is the one describing what went
+ * wrong; a close failure must not displace it.
+ */
+async function closeQuietly(database) {
+  try {
+    await database.close()
+  } catch {}
+}
+/**
+ * Collapses the write-ahead log back into the database file after a fold.
+ *
+ * Left alone, the WAL only grows: a 999-run backlog folded through the previous
+ * row-at-a-time path produced a 41 GB WAL beside a 1.4 GB database, roughly ten
+ * times the whole ledger in write amplification that no reader ever needed.
+ * `TRUNCATE` returns the space rather than merely marking it reusable.
+ *
+ * Deliberately `exec` and not `.all()`: the installed
+ * `@tursodatabase/database@0.3.2` bindings panic outright (a Rust
+ * index-out-of-bounds in `bindings/javascript/src/lib.rs`, which takes the
+ * process down rather than throwing) when asked to hand back this pragma's
+ * result row. `exec` and `.run()` both execute it without reading rows and were
+ * confirmed safe by hand against that version.
+ */
+async function checkpointQuietly(database) {
+  try {
+    await database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  } catch {}
+}
+/**
+ * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * collapses the WAL, and closes again. The entry point for the CLI and for any
+ * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
@@ -850,11 +979,16 @@ async function ingestAll(database) {
 async function ingest() {
   return await withIngestLock(async () => {
     const database = await openLedger()
+    let folded
     try {
-      return await foldUnIngestedRuns(database)
-    } finally {
-      await database.close()
+      folded = await foldUnIngestedRuns(database)
+    } catch (error) {
+      await closeQuietly(database)
+      throw error
     }
+    await checkpointQuietly(database)
+    await closeQuietly(database)
+    return folded
   })
 }
 

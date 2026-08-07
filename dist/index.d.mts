@@ -95,10 +95,14 @@ declare function openLedger(): Promise<Ledger>
  * Committing the marker with the rows it describes removes that window: either
  * both are there, or neither is.
  *
- * The short-circuit on `ingested_runs` remains, now purely as an optimization —
- * it saves reading and folding a run directory already known to be complete. The
- * per-row upserts on `runs`, `files`, and `tests` remain too, because within a
- * single fold they are what makes a re-ingest converge rather than conflict.
+ * The two mechanisms cover different cases and neither replaces the other. The
+ * `ingested_runs` short-circuit is what makes a *completed* run idempotent on a
+ * later re-ingest: `run_samples` and `turbo_tasks` would happily append a second
+ * copy of every row, since they have no key to conflict on. The transaction is
+ * what makes an *interrupted* run idempotent, by ensuring a fold that never
+ * finished left nothing for the retry to duplicate. The per-row upserts on
+ * `runs`, `files`, and `tests` remain too, because within a single fold they are
+ * what makes a re-ingest converge rather than conflict.
  * `INSERT OR REPLACE` was the natural spelling for that, but the installed
  * `@tursodatabase/database@0.3.2` engine rejects it at prepare time with "is
  * only supported with UPSERT", so the upsert form is used instead; it is the
@@ -128,8 +132,9 @@ type IngestResult = {
  */
 declare function ingestAll(database: Ledger): Promise<IngestResult>
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run, and
- * closes again. The entry point for the CLI and for any automated caller.
+ * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * collapses the WAL, and closes again. The entry point for the CLI and for any
+ * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
@@ -146,9 +151,10 @@ declare function ingest(): Promise<IngestResult>
  * The lock is a file created with the exclusive `wx` flag, which is atomic on
  * every filesystem we care about, so two invocations racing to create it always
  * produce exactly one winner. It carries a random token identifying its holder;
- * release only removes the file when the token still matches, so a process
- * whose lock was reclaimed as stale cannot delete its successor's lock on the
- * way out.
+ * release only removes the file when that token still matches, so a process
+ * whose lock was reclaimed as stale does not delete its successor's on the way
+ * out. (Read alongside {@link reclaimIfStale}, which is candid about the one
+ * window neither mechanism closes.)
  *
  * Held for the whole fold rather than per statement: the thing being made
  * mutually exclusive is one ingest against another, and a per-statement lock

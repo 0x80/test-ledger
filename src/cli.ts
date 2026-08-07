@@ -65,15 +65,12 @@ const cli = meow(
 const [command = 'runs'] = cli.input
 
 /**
- * Opened per command rather than once up front, because `ingest` must take the
- * ingest lock *before* the database file is opened: the driver locks the file
- * exclusively at open, so a second concurrent invocation that opened first
- * would crash instead of queueing. `ingest()` owns that ordering, and every
- * other command opens for itself here.
- */
-const database = command === 'ingest' ? undefined : await openLedger()
-
-/**
+ * `ingest` is dispatched before any ledger is opened, because it must take the
+ * ingest lock *before* the database file is opened: the driver locks that file
+ * exclusively at open, so a second concurrent invocation that opened first would
+ * crash rather than queue. `ingest()` owns that ordering end to end, which is
+ * why it takes no database argument.
+ *
  * `no-console` is only a warning in this repo's lint config, and every branch
  * below is the CLI's actual stdout/stderr output, so each `console.*` call
  * carries a scoped disable rather than being rewritten around.
@@ -82,10 +79,13 @@ if (command === 'ingest') {
   const result = await ingest()
   // oxlint-disable-next-line no-console -- this is the CLI's stdout output
   console.log(`ingested ${result.runs} run${result.runs === 1 ? '' : 's'}, ${result.rows} rows`)
-} else if (database === undefined) {
-  /** Unreachable: only the `ingest` branch above leaves the ledger unopened. */
-  throw new Error(`no ledger opened for command: ${command}`)
-} else if (command === 'flaky') {
+  process.exit(0)
+}
+
+/** Every remaining command reads or writes an open ledger, so open it once here. */
+const database = await openLedger()
+
+if (command === 'flaky') {
   // oxlint-disable-next-line no-console -- this is the CLI's stdout output
   console.log(
     table(await flakyReport(database, { minRuns: cli.flags.minRuns }), 'no flaky tests recorded'),
