@@ -262,12 +262,19 @@ function isLedgerEvent(value) {
 /**
  * How long to keep retrying before giving up on a held lock.
  *
- * Sized against a worst-case ingest, not a typical one: a batched fold of a
- * full-suite run is well under a second, so a minute of waiting means the
- * holder is doing something far larger (a first ingest of a long backlog)
- * rather than merely being slow.
+ * **Must stay comfortably larger than {@link STALE_AFTER_MS}**, and that is the
+ * whole reason for the value. A waiter that gave up first could never reach the
+ * reclamation path for a lock that went stale while it waited — it would exit
+ * minutes before the lock became eligible — so the only reclaimable lock would
+ * be one already stale when the waiter arrived. The earlier one-minute budget
+ * had exactly that defect.
+ *
+ * The upper bound is also sized against a real fold rather than a typical one.
+ * A batched full-suite run is well under a second, but a first ingest of a long
+ * backlog is legitimately minutes (999 runs measured at 53s), and a waiter
+ * behind one should queue rather than fail.
  */
-const ACQUIRE_TIMEOUT_MS = 6e4
+const ACQUIRE_TIMEOUT_MS = 900 * 1e3
 const RETRY_INTERVAL_MS = 100
 /**
  * A lock file older than this *may* be reclaimed — but only once its holder is

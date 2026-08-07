@@ -8,7 +8,7 @@ import {
   s as slowReport,
   t as ingest,
   u as flakyReport,
-} from './ingest-BWbwU9wK.mjs'
+} from './ingest-5uRQhPSq.mjs'
 import { a as runDir } from './paths-CmAFgNp9.mjs'
 import { rm } from 'node:fs/promises'
 import meow from 'meow'
@@ -85,50 +85,63 @@ const [command = 'runs'] = cli.input
 if (command === 'ingest') {
   const result = await ingest()
   console.log(`ingested ${result.runs} run${result.runs === 1 ? '' : 's'}, ${result.rows} rows`)
-  process.exit(0)
-}
-/** Every remaining command reads or writes an open ledger, so open it once here. */
-const database = await openLedger()
-if (command === 'flaky')
-  console.log(
-    table(await flakyReport(database, { minRuns: cli.flags.minRuns }), 'no flaky tests recorded'),
-  )
-else if (command === 'slow')
-  console.log(table(await slowReport(database, { limit: cli.flags.limit }), 'no files recorded'))
-else if (command === 'contention')
-  console.log(
-    table(await contentionReport(database, { limit: cli.flags.limit }), 'no runs recorded'),
-  )
-else if (command === 'shape') console.log(table(await shapeReport(database), 'no files recorded'))
-else if (command === 'runs')
-  console.log(table(await runsReport(database, { limit: cli.flags.limit }), 'no runs recorded'))
-else if (command === 'prune') {
-  const cutoff = Date.now() - cli.flags.days * 24 * 60 * 60 * 1e3
-  const staleRunIds = (
-    await database.prepare('SELECT run_id FROM runs WHERE started_at < ?').all([cutoff])
-  ).map((row) => row.run_id)
-  if (staleRunIds.length > 0) {
-    const placeholders = staleRunIds.map(() => '?').join(', ')
-    for (const childTable of ['tests', 'files', 'run_samples', 'turbo_tasks'])
-      await database
-        .prepare(`DELETE FROM ${childTable} WHERE run_id IN (${placeholders})`)
-        .run(staleRunIds)
-  }
-  await database.prepare('DELETE FROM runs WHERE started_at < ?').run([cutoff])
-  /**
-   * Age-based, not delete-after-ingest: the raw NDJSON stays available for
-   * the whole retention window (phase 2 re-ingests into a fresh synced
-   * database from exactly this retained NDJSON), and disk is still bounded
-   * once a run ages past it. `ingested_runs` is left untouched here — it is
-   * what stops a pruned run's directory from being silently re-ingested if
-   * it ever reappears (a restored backup, a synced copy from another
-   * machine), not a leftover this command forgot.
-   */
-  for (const runId of staleRunIds) await removeRunDirectory(runId)
-  console.log(`pruned runs older than ${cli.flags.days} days`)
 } else {
-  console.error(`unknown command: ${command}`)
-  process.exit(2)
+  /**
+   * Every remaining command reads or writes an open ledger, so open it once
+   * here — inside the `else` rather than after an early `process.exit(0)` in the
+   * branch above. Node's stdout is asynchronous whenever it is a pipe, so
+   * exiting immediately after `console.log` can terminate the process before the
+   * line is flushed, and this command's output is routinely piped or captured.
+   * Letting the branch fall through to a natural exit is what guarantees the
+   * result line is actually delivered.
+   */
+  const database = await openLedger()
+  if (command === 'flaky')
+    console.log(
+      table(await flakyReport(database, { minRuns: cli.flags.minRuns }), 'no flaky tests recorded'),
+    )
+  else if (command === 'slow')
+    console.log(table(await slowReport(database, { limit: cli.flags.limit }), 'no files recorded'))
+  else if (command === 'contention')
+    console.log(
+      table(await contentionReport(database, { limit: cli.flags.limit }), 'no runs recorded'),
+    )
+  else if (command === 'shape') console.log(table(await shapeReport(database), 'no files recorded'))
+  else if (command === 'runs')
+    console.log(table(await runsReport(database, { limit: cli.flags.limit }), 'no runs recorded'))
+  else if (command === 'prune') {
+    const cutoff = Date.now() - cli.flags.days * 24 * 60 * 60 * 1e3
+    const staleRunIds = (
+      await database.prepare('SELECT run_id FROM runs WHERE started_at < ?').all([cutoff])
+    ).map((row) => row.run_id)
+    if (staleRunIds.length > 0) {
+      const placeholders = staleRunIds.map(() => '?').join(', ')
+      for (const childTable of ['tests', 'files', 'run_samples', 'turbo_tasks'])
+        await database
+          .prepare(`DELETE FROM ${childTable} WHERE run_id IN (${placeholders})`)
+          .run(staleRunIds)
+    }
+    await database.prepare('DELETE FROM runs WHERE started_at < ?').run([cutoff])
+    /**
+     * Age-based, not delete-after-ingest: the raw NDJSON stays available for
+     * the whole retention window (phase 2 re-ingests into a fresh synced
+     * database from exactly this retained NDJSON), and disk is still bounded
+     * once a run ages past it. `ingested_runs` is left untouched here — it is
+     * what stops a pruned run's directory from being silently re-ingested if
+     * it ever reappears (a restored backup, a synced copy from another
+     * machine), not a leftover this command forgot.
+     */
+    for (const runId of staleRunIds) await removeRunDirectory(runId)
+    console.log(`pruned runs older than ${cli.flags.days} days`)
+  } else {
+    console.error(`unknown command: ${command}`)
+    /**
+     * `exitCode` rather than `process.exit(2)`, for the same flushing reason as
+     * the ingest branch: this sets the status and lets Node exit once stderr has
+     * drained, instead of racing it.
+     */
+    process.exitCode = 2
+  }
 }
 
 //#endregion
