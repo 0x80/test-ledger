@@ -16,11 +16,12 @@ const runDir = (runId) => path.join(runsDir(), runId)
 const eventsPath = (runId, pid) => path.join(runDir(runId), `${pid}.ndjson`)
 const databasePath = () => path.join(ledgerDir(), 'ledger.db')
 /**
- * Reserved for when ingest becomes automated (phase 2 wiring it into the
- * test-selection harness). Nothing acquires this lock today: concurrent
- * `ingest` invocations are currently unguarded, and the path exists so the
- * automated caller has somewhere to acquire it without a later schema/path
- * change.
+ * The lock `ingestAll` holds for the duration of a fold, so two concurrent
+ * `test-ledger ingest` invocations serialize instead of interleaving writes.
+ *
+ * Machine-global like the rest of the ledger directory, which is what makes it
+ * work across worktrees: the writers it has to exclude are separate processes
+ * started from unrelated checkouts, not threads of one run.
  */
 const ingestLockPath = () => path.join(ledgerDir(), 'ingest.lock')
 

@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { ingestAll, ingestRun } from '../src/store/ingest.ts'
+import { ingest, ingestAll, ingestRun } from '../src/store/ingest.ts'
+import { withIngestLock } from '../src/store/lock.ts'
 import { openLedger } from '../src/store/open.ts'
 
 let directory: string
@@ -16,6 +17,12 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env['TEST_LEDGER_DIR']
 })
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
 
 function writeRun(runId: string, events: Record<string, unknown>[]): void {
   const runDirectory = path.join(directory, 'runs', runId)
@@ -174,5 +181,111 @@ describe('ingest', () => {
 
     expect(result.runs).toBe(2)
     expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(2)
+  })
+
+  /**
+   * The last `file` or `test` event for a given primary key wins, matching the
+   * row-at-a-time upserts this replaced. Batching made this the caller's job:
+   * two rows with the same key in one `VALUES` list is not behavior to lean on.
+   */
+  it('converges on the last event for a repeated file or test', async () => {
+    writeRun('r1', [
+      { kind: 'file', runId: 'r1', file: '/a.test.ts', lane: 'unit', durationMs: 1 },
+      { kind: 'file', runId: 'r1', file: '/a.test.ts', lane: 'unit', durationMs: 2 },
+      { kind: 'test', runId: 'r1', file: '/a.test.ts', fullName: 'a > x', state: 'failed' },
+      { kind: 'test', runId: 'r1', file: '/a.test.ts', fullName: 'a > x', state: 'passed' },
+    ])
+
+    const database = await openLedger()
+    await ingestRun(database, 'r1')
+
+    const files = await database.prepare('SELECT * FROM files').all()
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({ duration_ms: 2 })
+
+    const tests = await database.prepare('SELECT * FROM tests').all()
+    expect(tests).toHaveLength(1)
+    expect(tests[0]).toMatchObject({ state: 'passed' })
+  })
+
+  /**
+   * The idempotency window this closes: `run_samples` and `turbo_tasks` are
+   * append-only with no per-row key, so a fold that died after their inserts
+   * but before the `ingested_runs` marker used to leave rows the retry
+   * duplicated. The whole fold is one transaction now, so a failed attempt
+   * leaves nothing behind and the retry writes exactly one copy.
+   */
+  it('leaves no rows behind when a fold fails partway, and does not duplicate on retry', async () => {
+    writeRun('r1', [
+      { kind: 'sample', runId: 'r1', at: 100, load1: 0.5, load5: 0.4 },
+      { kind: 'turbo_task', runId: 'r1', packageName: '@repo/foo', task: 'test' },
+      { kind: 'test', runId: 'r1', file: '/a.test.ts', fullName: 'a > x', state: 'passed' },
+    ])
+
+    const database = await openLedger()
+
+    /**
+     * Stands in for a crash: the `tests` insert is the last table written
+     * before the `ingested_runs` marker, so failing it lands the process
+     * exactly inside the old window.
+     */
+    let failNextTestsInsert = true
+    const crashing = new Proxy(database, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => {
+            if (failNextTestsInsert && sql.startsWith('INSERT INTO tests')) {
+              throw new Error('simulated crash mid-ingest')
+            }
+            return target.prepare(sql)
+          }
+        }
+        const value = Reflect.get(target, property) as unknown
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+
+    await expect(ingestRun(crashing, 'r1')).rejects.toThrow('simulated crash mid-ingest')
+
+    expect(await database.prepare('SELECT * FROM run_samples').all()).toHaveLength(0)
+    expect(await database.prepare('SELECT * FROM turbo_tasks').all()).toHaveLength(0)
+    expect(await database.prepare('SELECT * FROM ingested_runs').all()).toHaveLength(0)
+
+    failNextTestsInsert = false
+    await ingestRun(database, 'r1')
+
+    expect(await database.prepare('SELECT * FROM run_samples').all()).toHaveLength(1)
+    expect(await database.prepare('SELECT * FROM turbo_tasks').all()).toHaveLength(1)
+    expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(1)
+  })
+
+  /**
+   * The lock is only load-bearing if it is taken before the database file is
+   * opened: the driver locks that file exclusively at open, so an `ingest` that
+   * opened first would crash rather than queue. `ingest()` is the entry point
+   * that gets the ordering right, and this pins it — the sweep must not finish
+   * until an unrelated lock holder has let go.
+   */
+  it('waits for the ingest lock before opening the ledger', async () => {
+    writeRun('r1', [{ kind: 'test', runId: 'r1', file: '/a.ts', fullName: 'x', state: 'passed' }])
+
+    const completed: string[] = []
+
+    const holder = withIngestLock(async () => {
+      await sleep(300)
+      completed.push('holder')
+    })
+    const sweep = ingest().then((result) => {
+      completed.push('ingest')
+      return result
+    })
+
+    const [, result] = await Promise.all([holder, sweep])
+
+    expect(completed).toEqual(['holder', 'ingest'])
+    expect(result.runs).toBe(1)
+
+    const database = await openLedger()
+    expect(await database.prepare('SELECT * FROM tests').all()).toHaveLength(1)
   })
 })

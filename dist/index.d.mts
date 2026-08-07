@@ -35,11 +35,12 @@ declare const runDir: (runId: string) => string
 declare const eventsPath: (runId: string, pid: number) => string
 declare const databasePath: () => string
 /**
- * Reserved for when ingest becomes automated (phase 2 wiring it into the
- * test-selection harness). Nothing acquires this lock today: concurrent
- * `ingest` invocations are currently unguarded, and the path exists so the
- * automated caller has somewhere to acquire it without a later schema/path
- * change.
+ * The lock `ingestAll` holds for the duration of a fold, so two concurrent
+ * `test-ledger ingest` invocations serialize instead of interleaving writes.
+ *
+ * Machine-global like the rest of the ledger directory, which is what makes it
+ * work across worktrees: the writers it has to exclude are separate processes
+ * started from unrelated checkouts, not threads of one run.
  */
 declare const ingestLockPath: () => string
 //#endregion
@@ -85,33 +86,76 @@ declare function openLedger(): Promise<Ledger>
 /**
  * Folds one run's events into the tables.
  *
- * Idempotent two ways at once, deliberately layered rather than relying on
- * either alone:
+ * The whole fold — every table plus the `ingested_runs` marker — commits as one
+ * transaction, which is what makes it idempotent. `run_samples` and
+ * `turbo_tasks` are append-only with no per-row key, so they have no
+ * convergence of their own; before the transaction, a process that died between
+ * their inserts and the `ingested_runs` write left rows the retry duplicated,
+ * because the short-circuit never fired for a run the database had no record of.
+ * Committing the marker with the rows it describes removes that window: either
+ * both are there, or neither is.
  *
- * 1. A short-circuit up front: if `ingested_runs` already has this `runId`,
- *    return `0` without touching any table. This is what makes the whole run
- *    idempotent, including `run_samples` and `turbo_tasks`, which are plain
- *    `INSERT` with no primary key (append-only time series, by design) and so
- *    have no per-row convergence of their own — without this check, a second
- *    `ingestRun` on an already-completed directory would duplicate their rows.
- * 2. Per-row upserts (`INSERT ... ON CONFLICT ... DO UPDATE SET`) on `runs`,
- *    `files`, and `tests`. These stay even though (1) makes them redundant on
- *    a *completed* re-ingest, because they are what makes a *partial* one
- *    safe: a prior process that died mid-ingest never reached the final
- *    `ingested_runs` write, so the short-circuit does not fire and the run
- *    re-executes in full, converging on the same rows rather than duplicating
- *    the partial write. `INSERT OR REPLACE` was the natural spelling for
- *    that, but the installed `@tursodatabase/database@0.3.2` engine rejects it
- *    at prepare time with "is only supported with UPSERT", so the upsert form
- *    is used instead; it is the standard-SQL equivalent and converges to the
- *    same rows.
+ * The short-circuit on `ingested_runs` remains, now purely as an optimization —
+ * it saves reading and folding a run directory already known to be complete. The
+ * per-row upserts on `runs`, `files`, and `tests` remain too, because within a
+ * single fold they are what makes a re-ingest converge rather than conflict.
+ * `INSERT OR REPLACE` was the natural spelling for that, but the installed
+ * `@tursodatabase/database@0.3.2` engine rejects it at prepare time with "is
+ * only supported with UPSERT", so the upsert form is used instead; it is the
+ * standard-SQL equivalent and converges to the same rows.
+ *
+ * Not self-locking: {@link ingestAll} holds the ingest lock across every run it
+ * folds, and acquiring it here as well would deadlock. A caller driving
+ * `ingestRun` directly wraps it in {@link withIngestLock} itself.
  */
 declare function ingestRun(database: Ledger, runId: string): Promise<number>
-/** Folds every run directory not already recorded in `ingested_runs`. */
-declare function ingestAll(database: Ledger): Promise<{
+type IngestResult = {
   runs: number
   rows: number
-}>
+}
+/**
+ * Folds every un-ingested run directory into an already-open ledger.
+ *
+ * Holds the ingest lock for the whole sweep rather than per run: taking it per
+ * run would let a second invocation slot whole runs in between a first one's,
+ * which is exactly the interleaving the lock exists to prevent.
+ *
+ * Prefer {@link ingest} unless you already hold an open ledger for other
+ * reasons. The database file itself is locked by the driver at open, so a
+ * second process that opens before calling this fails at `openLedger` rather
+ * than waiting here — the lock can only make invocations queue when it is taken
+ * before the file is opened, which is what `ingest` does.
+ */
+declare function ingestAll(database: Ledger): Promise<IngestResult>
+/**
+ * Acquires the ingest lock, opens the ledger, folds every un-ingested run, and
+ * closes again. The entry point for the CLI and for any automated caller.
+ *
+ * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
+ * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
+ * first dies with "File is locked by another process" before it can queue on
+ * anything. Taking the ingest lock around the open turns that crash into a wait,
+ * and closing before release means the next holder finds the file free.
+ */
+declare function ingest(): Promise<IngestResult>
+//#endregion
+//#region src/store/lock.d.ts
+/**
+ * Runs `fn` while holding the ledger's ingest lock.
+ *
+ * The lock is a file created with the exclusive `wx` flag, which is atomic on
+ * every filesystem we care about, so two invocations racing to create it always
+ * produce exactly one winner. It carries a random token identifying its holder;
+ * release only removes the file when the token still matches, so a process
+ * whose lock was reclaimed as stale cannot delete its successor's lock on the
+ * way out.
+ *
+ * Held for the whole fold rather than per statement: the thing being made
+ * mutually exclusive is one ingest against another, and a per-statement lock
+ * would let two invocations interleave whole runs while never overlapping on a
+ * single write.
+ */
+declare function withIngestLock<T>(fn: () => Promise<T>): Promise<T>
 //#endregion
 //#region src/reports/flaky.d.ts
 type FlakyRow = {
@@ -263,6 +307,7 @@ export {
   FailureClass,
   FileEvent,
   type FlakyRow,
+  type IngestResult,
   Lane,
   type Ledger,
   LedgerEvent,
@@ -280,6 +325,7 @@ export {
   databasePath,
   eventsPath,
   flakyReport,
+  ingest,
   ingestAll,
   ingestLockPath,
   ingestRun,
@@ -295,6 +341,7 @@ export {
   slowReport,
   startSampler,
   table,
+  withIngestLock,
   writeRunEnd,
   writeRunStart,
 }

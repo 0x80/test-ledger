@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 import {
-  a as slowReport,
-  c as flakyReport,
-  l as contentionReport,
-  n as ingestAll,
-  o as shapeReport,
-  s as runsReport,
-  t as openLedger,
-  u as table,
-} from './open-D6w0DFnN.mjs'
-import { a as runDir } from './paths-BGXkNXdx.mjs'
+  c as shapeReport,
+  d as contentionReport,
+  f as table,
+  i as openLedger,
+  l as runsReport,
+  s as slowReport,
+  t as ingest,
+  u as flakyReport,
+} from './ingest-CjXKGTc3.mjs'
+import { a as runDir } from './paths-CmAFgNp9.mjs'
 import { rm } from 'node:fs/promises'
 import meow from 'meow'
 
@@ -71,16 +71,26 @@ const cli = meow(
   },
 )
 const [command = 'runs'] = cli.input
-const database = await openLedger()
+/**
+ * Opened per command rather than once up front, because `ingest` must take the
+ * ingest lock *before* the database file is opened: the driver locks the file
+ * exclusively at open, so a second concurrent invocation that opened first
+ * would crash instead of queueing. `ingest()` owns that ordering, and every
+ * other command opens for itself here.
+ */
+const database = command === 'ingest' ? void 0 : await openLedger()
 /**
  * `no-console` is only a warning in this repo's lint config, and every branch
  * below is the CLI's actual stdout/stderr output, so each `console.*` call
  * carries a scoped disable rather than being rewritten around.
  */
 if (command === 'ingest') {
-  const result = await ingestAll(database)
+  const result = await ingest()
   console.log(`ingested ${result.runs} run${result.runs === 1 ? '' : 's'}, ${result.rows} rows`)
-} else if (command === 'flaky')
+} else if (database === void 0)
+  /** Unreachable: only the `ingest` branch above leaves the ledger unopened. */
+  throw new Error(`no ledger opened for command: ${command}`)
+else if (command === 'flaky')
   console.log(
     table(await flakyReport(database, { minRuns: cli.flags.minRuns }), 'no flaky tests recorded'),
   )

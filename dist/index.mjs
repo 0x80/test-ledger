@@ -1,15 +1,17 @@
 import {
-  a as slowReport,
-  c as flakyReport,
-  i as isLedgerEvent,
-  l as contentionReport,
+  a as withIngestLock,
+  c as shapeReport,
+  d as contentionReport,
+  f as table,
+  i as openLedger,
+  l as runsReport,
   n as ingestAll,
-  o as shapeReport,
+  o as isLedgerEvent,
   r as ingestRun,
-  s as runsReport,
-  t as openLedger,
-  u as table,
-} from './open-D6w0DFnN.mjs'
+  s as slowReport,
+  t as ingest,
+  u as flakyReport,
+} from './ingest-CjXKGTc3.mjs'
 import {
   a as runDir,
   i as ledgerDir,
@@ -17,7 +19,7 @@ import {
   o as runsDir,
   r as ingestLockPath,
   t as databasePath,
-} from './paths-BGXkNXdx.mjs'
+} from './paths-CmAFgNp9.mjs'
 import { t as classifyFailure } from './failure-class-CcnPcZ9E.mjs'
 import { t as mintRunId } from './run-id-CEax1HmG.mjs'
 import {
@@ -26,7 +28,7 @@ import {
   n as startSampler,
   r as appendEvents,
   t as parseTurboSummary,
-} from './turbo-summary-CGAprt0j.mjs'
+} from './turbo-summary-BTXxLUP5.mjs'
 
 export {
   appendEvents,
@@ -35,6 +37,7 @@ export {
   databasePath,
   eventsPath,
   flakyReport,
+  ingest,
   ingestAll,
   ingestLockPath,
   ingestRun,
@@ -50,6 +53,7 @@ export {
   slowReport,
   startSampler,
   table,
+  withIngestLock,
   writeRunEnd,
   writeRunStart,
 }

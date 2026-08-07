@@ -10,7 +10,7 @@ import { flakyReport } from './reports/flaky.ts'
 import { runsReport } from './reports/runs.ts'
 import { shapeReport } from './reports/shape.ts'
 import { slowReport } from './reports/slow.ts'
-import { ingestAll } from './store/ingest.ts'
+import { ingest } from './store/ingest.ts'
 import { openLedger } from './store/open.ts'
 
 /**
@@ -63,7 +63,15 @@ const cli = meow(
 )
 
 const [command = 'runs'] = cli.input
-const database = await openLedger()
+
+/**
+ * Opened per command rather than once up front, because `ingest` must take the
+ * ingest lock *before* the database file is opened: the driver locks the file
+ * exclusively at open, so a second concurrent invocation that opened first
+ * would crash instead of queueing. `ingest()` owns that ordering, and every
+ * other command opens for itself here.
+ */
+const database = command === 'ingest' ? undefined : await openLedger()
 
 /**
  * `no-console` is only a warning in this repo's lint config, and every branch
@@ -71,9 +79,12 @@ const database = await openLedger()
  * carries a scoped disable rather than being rewritten around.
  */
 if (command === 'ingest') {
-  const result = await ingestAll(database)
+  const result = await ingest()
   // oxlint-disable-next-line no-console -- this is the CLI's stdout output
   console.log(`ingested ${result.runs} run${result.runs === 1 ? '' : 's'}, ${result.rows} rows`)
+} else if (database === undefined) {
+  /** Unreachable: only the `ingest` branch above leaves the ledger unopened. */
+  throw new Error(`no ledger opened for command: ${command}`)
 } else if (command === 'flaky') {
   // oxlint-disable-next-line no-console -- this is the CLI's stdout output
   console.log(

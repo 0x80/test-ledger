@@ -34,7 +34,7 @@ no registry, no token, no global pnpm config.
   (`writeRunStart`, `writeRunEnd`, `appendEvents`), the load sampler (`startSampler`), the Turbo
   summary parser (`parseTurboSummary`), the run-id minter (`mintRunId`), the failure classifier
   (`classifyFailure`), the event types (`LedgerEvent`, `Lane`, `FailureClass`, …), the store
-  (`openLedger`, `ingestAll`, `ingestRun`), and every report (`flakyReport`, `slowReport`,
+  (`openLedger`, `ingest`, `ingestAll`, `ingestRun`, `withIngestLock`), and every report (`flakyReport`, `slowReport`,
   `contentionReport`, `shapeReport`, `runsReport`).
 - **`./reporter`** — `TestLedgerReporter`, the Vitest custom reporter. Kept as its own subpath so a
   Vitest config can resolve it as a reporter module path without pulling the rest of the package's
@@ -154,7 +154,14 @@ prevent:
   telemetry at all.
 - **Ingest is idempotent.** Each run directory is folded in at most once, tracked in the database's
   `ingested_runs` table; re-running `ingest` against an already-folded run is a no-op, not a
-  duplicate insert.
+  duplicate insert. A run's whole fold — every table plus that marker — commits as one transaction,
+  so an interrupted ingest leaves nothing behind for the retry to duplicate. This matters most for
+  `run_samples` and `turbo_tasks`, which are append-only with no per-row key and so have no
+  convergence of their own.
+- **Ingest is serialized by a lock.** `test-ledger ingest` holds `ingest.lock` in the ledger
+  directory for the whole fold, taken before the database file is opened — the driver locks that
+  file exclusively at open, so without it a second concurrent invocation would die on the file
+  rather than queue. A lock left behind by a killed process is reclaimed after ten minutes.
 - **NDJSON is the durable raw form.** The SQLite database is a derived view, always rebuildable
   from the retained NDJSON. Nothing about this package's design should ever make the NDJSON files
   disposable ahead of the database that was built from them — a future re-ingest into a different
@@ -164,14 +171,8 @@ prevent:
 
 Honestly, not aspirationally:
 
-- **Ingest is unbatched and slow on large runs.** Each event is inserted individually rather than
-  in a batched transaction; folding a run with many thousands of test events can take noticeably
-  longer than it should. Fine for the current local, on-demand usage; would need attention before
-  any automated/frequent ingest.
-- **The ingest lock is unacquired.** `ingestLockPath()` exists as a reserved path, but nothing takes
-  it yet. There is exactly one caller today (`test-ledger ingest`, run by hand), so there is no
-  concurrent writer — but the lock becomes load-bearing the moment ingest is automated, and until
-  then two concurrent `ingest` invocations are genuinely unguarded.
+- **Only ingest takes the lock.** `prune` writes to the same database without holding it, so a
+  prune racing an ingest still fails on the driver's own file lock rather than waiting for its turn.
 - **No sync.** Everything here is local-only, through `@tursodatabase/database`. Pushing this data
   to a shared/remote database (`@tursodatabase/sync`, credentials, `push()`) is designed but not
   built — a synced database carries change-tracking state a local-only file doesn't, so that phase
