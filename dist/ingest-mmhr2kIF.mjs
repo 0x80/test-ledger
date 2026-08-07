@@ -384,12 +384,7 @@ async function reclaimIfStale(path$1) {
   if (Date.now() - modifiedAt < STALE_AFTER_MS) return false
   const holder = await readLockFile(path$1)
   if (holderIsAlive(holder)) return false
-  /**
-   * Re-read immediately before removing, so a lock replaced since the `stat`
-   * above is left alone. Narrowing, not a guarantee — see the docblock.
-   */
-  const stillTheSameHolder = await readLockFile(path$1)
-  if (holder !== void 0 && stillTheSameHolder?.token !== holder.token) return false
+  if ((await readLockFile(path$1))?.token !== holder?.token) return false
   await rm(path$1, { force: true })
   return true
 }
@@ -438,7 +433,9 @@ async function withIngestLock(fn) {
         try {
           await handle.close()
         } catch {}
-        await rm(path$1, { force: true })
+        try {
+          await rm(path$1, { force: true })
+        } catch {}
         throw error
       }
       break
@@ -946,6 +943,14 @@ async function ingestAll(database) {
  * not a failure to ingest — reporting one would call a successful run broken.
  * And when the fold already threw, that error is the one describing what went
  * wrong; a close failure must not displace it.
+ *
+ * The one cost worth naming: a connection that failed to close may still hold
+ * the driver's exclusive OS lock on `ledger.db` after this function releases
+ * the ingest lock, so the next ingest could fail at open rather than queue.
+ * For the CLI that is unreachable — the process exits immediately afterward and
+ * the OS drops the handle — and for a long-lived caller a failed close is
+ * already a broken connection it has to deal with. Swallowing is still the
+ * right trade against reporting a committed fold as failed.
  */
 async function closeQuietly(database) {
   try {
@@ -990,6 +995,15 @@ async function ingest() {
     try {
       folded = await foldUnIngestedRuns(database)
     } catch (error) {
+      /**
+       * Checkpoint on the way out of a *failed* sweep too, not only a clean
+       * one. A sweep commits run by run, so one that dies on run 900 still
+       * committed 899 runs' worth of WAL frames — and a long backlog fold
+       * dying partway is precisely how the 41 GB WAL that motivated this
+       * happened. Skipping the checkpoint here would leave the worst case
+       * uncovered while handling the cheap one.
+       */
+      await checkpointQuietly(database)
       await closeQuietly(database)
       throw error
     }

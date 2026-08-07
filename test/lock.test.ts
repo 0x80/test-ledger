@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { readFile, rm, utimes } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
@@ -78,10 +79,22 @@ describe('withIngestLock', () => {
    * hard kill would wedge every later ingest on the machine permanently.
    */
   it('reclaims a lock left behind by a killed holder', async () => {
+    /**
+     * A genuinely dead pid on *this* host, so the reclaim path runs through
+     * `process.kill(pid, 0)` and its `ESRCH` branch. An earlier version of this
+     * test used a foreign hostname, which short-circuits the liveness probe
+     * before it ever signals — leaving the same-host dead-holder case, the one
+     * that actually unwedges a `kill -9`ed ingest, with no coverage at all.
+     */
+    const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)'])
+    expect(dead.status).toBe(0)
+    const deadPid = dead.pid
+    expect(deadPid).toBeGreaterThan(0)
+
     mkdirSync(directory, { recursive: true })
     writeFileSync(
       ingestLockPath(),
-      JSON.stringify({ token: 'dead', pid: 1, host: 'gone', acquiredAt: 0 }),
+      JSON.stringify({ token: 'dead', pid: deadPid, host: hostname(), acquiredAt: 0 }),
     )
     await ageLockFile()
 

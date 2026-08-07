@@ -151,9 +151,16 @@ async function reclaimIfStale(path: string): Promise<boolean> {
   /**
    * Re-read immediately before removing, so a lock replaced since the `stat`
    * above is left alone. Narrowing, not a guarantee — see the docblock.
+   *
+   * The comparison is unconditional on purpose. Guarding it on the first read
+   * having parsed would skip the check exactly when the lock was malformed —
+   * which is also what a half-written *successor* looks like — and delete it.
+   * Comparing `token` on both sides covers every combination: two reads that
+   * disagree, in either direction, mean the file changed underneath and it is
+   * not ours to remove.
    */
   const stillTheSameHolder = await readLockFile(path)
-  if (holder !== undefined && stillTheSameHolder?.token !== holder.token) return false
+  if (stillTheSameHolder?.token !== holder?.token) return false
 
   await rm(path, { force: true })
   return true
@@ -208,7 +215,16 @@ export async function withIngestLock<T>(fn: () => Promise<T>): Promise<T> {
         } catch {
           /** Already failing; the close outcome cannot improve the diagnosis. */
         }
-        await rm(path, { force: true })
+        try {
+          await rm(path, { force: true })
+        } catch {
+          /**
+           * Cleanup, not diagnosis. If the orphan can't be removed it will be
+           * reclaimed as stale later, whereas letting this failure propagate
+           * would replace the write/close error that actually explains what
+           * went wrong — the one thing the surrounding block exists to keep.
+           */
+        }
         throw error
       }
       break
