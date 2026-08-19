@@ -35,14 +35,15 @@ declare const runDir: (runId: string) => string
 declare const eventsPath: (runId: string, pid: number) => string
 declare const databasePath: () => string
 /**
- * The lock `ingestAll` holds for the duration of a fold, so two concurrent
- * `test-ledger ingest` invocations serialize instead of interleaving writes.
+ * The lock every command that writes `ledger.db` holds before opening it, so
+ * concurrent ingest and prune invocations serialize instead of interleaving
+ * writes or colliding on the driver's exclusive file lock.
  *
  * Machine-global like the rest of the ledger directory, which is what makes it
  * work across worktrees: the writers it has to exclude are separate processes
  * started from unrelated checkouts, not threads of one run.
  */
-declare const ingestLockPath: () => string
+declare const ledgerWriterLockPath: () => string
 //#endregion
 //#region src/failure-class.d.ts
 /**
@@ -108,9 +109,9 @@ declare function openLedger(): Promise<Ledger>
  * only supported with UPSERT", so the upsert form is used instead; it is the
  * standard-SQL equivalent and converges to the same rows.
  *
- * Not self-locking: {@link ingestAll} holds the ingest lock across every run it
+ * Not self-locking: {@link ingestAll} holds the ledger writer lock across every run it
  * folds, and acquiring it here as well would deadlock. A caller driving
- * `ingestRun` directly wraps it in {@link withIngestLock} itself.
+ * `ingestRun` directly wraps it in {@link withLedgerWriterLock} itself.
  */
 declare function ingestRun(database: Ledger, runId: string): Promise<number>
 type IngestResult = {
@@ -120,7 +121,7 @@ type IngestResult = {
 /**
  * Folds every un-ingested run directory into an already-open ledger.
  *
- * Holds the ingest lock for the whole sweep rather than per run: taking it per
+ * Holds the ledger writer lock for the whole sweep rather than per run: taking it per
  * run would let a second invocation slot whole runs in between a first one's,
  * which is exactly the interleaving the lock exists to prevent.
  *
@@ -132,21 +133,21 @@ type IngestResult = {
  */
 declare function ingestAll(database: Ledger): Promise<IngestResult>
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * Acquires the ledger writer lock, opens the ledger, folds every un-ingested run,
  * collapses the WAL, and closes again. The entry point for the CLI and for any
  * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
  * first dies with "File is locked by another process" before it can queue on
- * anything. Taking the ingest lock around the open turns that crash into a wait,
+ * anything. Taking the ledger writer lock around the open turns that crash into a wait,
  * and closing before release means the next holder finds the file free.
  */
 declare function ingest(): Promise<IngestResult>
 //#endregion
 //#region src/store/lock.d.ts
 /**
- * Runs `fn` while holding the ledger's ingest lock.
+ * Runs `fn` while holding the ledger's writer lock.
  *
  * The lock is a file created with the exclusive `wx` flag, which is atomic on
  * every filesystem we care about, so two invocations racing to create it always
@@ -156,12 +157,10 @@ declare function ingest(): Promise<IngestResult>
  * out. (Read alongside {@link reclaimIfStale}, which is candid about the one
  * window neither mechanism closes.)
  *
- * Held for the whole fold rather than per statement: the thing being made
- * mutually exclusive is one ingest against another, and a per-statement lock
- * would let two invocations interleave whole runs while never overlapping on a
- * single write.
+ * Held for the whole database operation rather than per statement: a
+ * per-statement lock would let writers interleave partial operations.
  */
-declare function withIngestLock<T>(fn: () => Promise<T>): Promise<T>
+declare function withLedgerWriterLock<T>(fn: () => Promise<T>): Promise<T>
 //#endregion
 //#region src/reports/flaky.d.ts
 type FlakyRow = {
@@ -335,10 +334,10 @@ export {
   flakyReport,
   ingest,
   ingestAll,
-  ingestLockPath,
   ingestRun,
   isLedgerEvent,
   ledgerDir,
+  ledgerWriterLockPath,
   mintRunId,
   openLedger,
   parseTurboSummary,
@@ -349,7 +348,7 @@ export {
   slowReport,
   startSampler,
   table,
-  withIngestLock,
+  withLedgerWriterLock,
   writeRunEnd,
   writeRunStart,
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {
+  a as withLedgerWriterLock,
   c as shapeReport,
   d as contentionReport,
   f as table,
@@ -8,21 +9,18 @@ import {
   s as slowReport,
   t as ingest,
   u as flakyReport,
-} from './ingest-DLerKZDD.mjs'
-import { a as runDir } from './paths-CmAFgNp9.mjs'
-import { rm } from 'node:fs/promises'
+} from './ingest-qOPSXg96.mjs'
+import { a as runDir } from './paths-ZwcASZDt.mjs'
 import meow from 'meow'
+import { rm } from 'node:fs/promises'
 
-//#region src/cli.ts
+//#region src/store/prune.ts
 /**
  * Removes one run's NDJSON directory.
  *
  * A missing directory is not an error: the run may have been ingested on one
  * machine and pruned on another, or a prior prune already removed it. Only
- * `ENOENT` is swallowed, mirroring the narrowing `ingest.ts`'s
- * `readRunEvents` applies to the same failure mode; any other error (a
- * permissions problem, a busy handle) is a real filesystem failure and must
- * propagate.
+ * `ENOENT` is swallowed; any other filesystem failure must propagate.
  */
 async function removeRunDirectory(runId) {
   try {
@@ -32,6 +30,47 @@ async function removeRunDirectory(runId) {
     throw error
   }
 }
+/**
+ * Removes runs older than `days` under the ledger writer lock.
+ *
+ * The lock comes before `openLedger()` because the driver locks `ledger.db`
+ * exclusively at open. Closing the connection before releasing the lock lets
+ * the next writer proceed instead of colliding with an open file handle.
+ */
+async function prune(days) {
+  await withLedgerWriterLock(async () => {
+    const database = await openLedger()
+    try {
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1e3
+      const staleRunIds = (
+        await database.prepare('SELECT run_id FROM runs WHERE started_at < ?').all([cutoff])
+      ).map((row) => row.run_id)
+      if (staleRunIds.length > 0) {
+        const placeholders = staleRunIds.map(() => '?').join(', ')
+        for (const childTable of ['tests', 'files', 'run_samples', 'turbo_tasks'])
+          await database
+            .prepare(`DELETE FROM ${childTable} WHERE run_id IN (${placeholders})`)
+            .run(staleRunIds)
+      }
+      await database.prepare('DELETE FROM runs WHERE started_at < ?').run([cutoff])
+      /**
+       * Age-based, not delete-after-ingest: the raw NDJSON stays available for
+       * the whole retention window (phase 2 re-ingests into a fresh synced
+       * database from exactly this retained NDJSON), and disk is still bounded
+       * once a run ages past it. `ingested_runs` is left untouched here — it is
+       * what stops a pruned run's directory from being silently re-ingested if
+       * it ever reappears (a restored backup, a synced copy from another
+       * machine), not a leftover this command forgot.
+       */
+      for (const runId of staleRunIds) await removeRunDirectory(runId)
+    } finally {
+      await database.close()
+    }
+  })
+}
+
+//#endregion
+//#region src/cli.ts
 /** The `test-ledger` bin entry point: ingest, the five reports, and prune. */
 const cli = meow(
   `
@@ -72,11 +111,9 @@ const cli = meow(
 )
 const [command = 'runs'] = cli.input
 /**
- * `ingest` is dispatched before any ledger is opened, because it must take the
- * ingest lock *before* the database file is opened: the driver locks that file
- * exclusively at open, so a second concurrent invocation that opened first would
- * crash rather than queue. `ingest()` owns that ordering end to end, which is
- * why it takes no database argument.
+ * Writer commands are dispatched before any ledger is opened, because they must
+ * take the ledger writer lock first. The driver locks the database file
+ * exclusively at open, so opening first would crash rather than queue.
  *
  * `no-console` is only a warning in this repo's lint config, and every branch
  * below is the CLI's actual stdout/stderr output, so each `console.*` call
@@ -85,15 +122,14 @@ const [command = 'runs'] = cli.input
 if (command === 'ingest') {
   const result = await ingest()
   console.log(`ingested ${result.runs} run${result.runs === 1 ? '' : 's'}, ${result.rows} rows`)
+} else if (command === 'prune') {
+  await prune(cli.flags.days)
+  console.log(`pruned runs older than ${cli.flags.days} days`)
 } else {
   /**
-   * Every remaining command reads or writes an open ledger, so open it once
-   * here — inside the `else` rather than after an early `process.exit(0)` in the
-   * branch above. Node's stdout is asynchronous whenever it is a pipe, so
-   * exiting immediately after `console.log` can terminate the process before the
-   * line is flushed, and this command's output is routinely piped or captured.
-   * Letting the branch fall through to a natural exit is what guarantees the
-   * result line is actually delivered.
+   * Report commands share one open ledger. Node's stdout is asynchronous when it
+   * is a pipe, so this branch falls through naturally instead of exiting after
+   * printing and truncating captured output.
    */
   const database = await openLedger()
   if (command === 'flaky')
@@ -109,31 +145,7 @@ if (command === 'ingest') {
   else if (command === 'shape') console.log(table(await shapeReport(database), 'no files recorded'))
   else if (command === 'runs')
     console.log(table(await runsReport(database, { limit: cli.flags.limit }), 'no runs recorded'))
-  else if (command === 'prune') {
-    const cutoff = Date.now() - cli.flags.days * 24 * 60 * 60 * 1e3
-    const staleRunIds = (
-      await database.prepare('SELECT run_id FROM runs WHERE started_at < ?').all([cutoff])
-    ).map((row) => row.run_id)
-    if (staleRunIds.length > 0) {
-      const placeholders = staleRunIds.map(() => '?').join(', ')
-      for (const childTable of ['tests', 'files', 'run_samples', 'turbo_tasks'])
-        await database
-          .prepare(`DELETE FROM ${childTable} WHERE run_id IN (${placeholders})`)
-          .run(staleRunIds)
-    }
-    await database.prepare('DELETE FROM runs WHERE started_at < ?').run([cutoff])
-    /**
-     * Age-based, not delete-after-ingest: the raw NDJSON stays available for
-     * the whole retention window (phase 2 re-ingests into a fresh synced
-     * database from exactly this retained NDJSON), and disk is still bounded
-     * once a run ages past it. `ingested_runs` is left untouched here — it is
-     * what stops a pruned run's directory from being silently re-ingested if
-     * it ever reappears (a restored backup, a synced copy from another
-     * machine), not a leftover this command forgot.
-     */
-    for (const runId of staleRunIds) await removeRunDirectory(runId)
-    console.log(`pruned runs older than ${cli.flags.days} days`)
-  } else {
+  else {
     console.error(`unknown command: ${command}`)
     /**
      * `exitCode` rather than `process.exit(2)`, for the same flushing reason as
