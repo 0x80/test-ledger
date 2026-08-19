@@ -3,7 +3,7 @@ import path from 'node:path'
 
 import { isLedgerEvent, type LedgerEvent } from '../events.ts'
 import { runDir, runsDir } from '../paths.ts'
-import { withIngestLock } from './lock.ts'
+import { withLedgerWriterLock } from './lock.ts'
 import { openLedger, type Ledger } from './open.ts'
 
 type SqlValue = string | number | null
@@ -239,9 +239,9 @@ const TEST_COLUMNS = [
  * only supported with UPSERT", so the upsert form is used instead; it is the
  * standard-SQL equivalent and converges to the same rows.
  *
- * Not self-locking: {@link ingestAll} holds the ingest lock across every run it
+ * Not self-locking: {@link ingestAll} holds the ledger writer lock across every run it
  * folds, and acquiring it here as well would deadlock. A caller driving
- * `ingestRun` directly wraps it in {@link withIngestLock} itself.
+ * `ingestRun` directly wraps it in {@link withLedgerWriterLock} itself.
  */
 export async function ingestRun(database: Ledger, runId: string): Promise<number> {
   const alreadyIngested: unknown = await database
@@ -369,7 +369,7 @@ export async function ingestRun(database: Ledger, runId: string): Promise<number
 
 export type IngestResult = { runs: number; rows: number }
 
-/** The sweep itself. Both exported entry points below run it under the ingest lock. */
+/** The sweep itself. Both exported entry points below run it under the ledger writer lock. */
 async function foldUnIngestedRuns(database: Ledger): Promise<IngestResult> {
   let directories: string[]
   try {
@@ -396,7 +396,7 @@ async function foldUnIngestedRuns(database: Ledger): Promise<IngestResult> {
 /**
  * Folds every un-ingested run directory into an already-open ledger.
  *
- * Holds the ingest lock for the whole sweep rather than per run: taking it per
+ * Holds the ledger writer lock for the whole sweep rather than per run: taking it per
  * run would let a second invocation slot whole runs in between a first one's,
  * which is exactly the interleaving the lock exists to prevent.
  *
@@ -407,7 +407,7 @@ async function foldUnIngestedRuns(database: Ledger): Promise<IngestResult> {
  * before the file is opened, which is what `ingest` does.
  */
 export async function ingestAll(database: Ledger): Promise<IngestResult> {
-  const result = await withIngestLock(async () => {
+  const result = await withLedgerWriterLock(async () => {
     const swept = await foldUnIngestedRuns(database)
     return swept
   })
@@ -425,7 +425,7 @@ export async function ingestAll(database: Ledger): Promise<IngestResult> {
  *
  * The one cost worth naming: a connection that failed to close may still hold
  * the driver's exclusive OS lock on `ledger.db` after this function releases
- * the ingest lock, so the next ingest could fail at open rather than queue.
+ * the ledger writer lock, so the next writer could fail at open rather than queue.
  * For the CLI that is unreachable — the process exits immediately afterward and
  * the OS drops the handle — and for a long-lived caller a failed close is
  * already a broken connection it has to deal with. Swallowing is still the
@@ -463,18 +463,18 @@ async function checkpointQuietly(database: Ledger): Promise<void> {
 }
 
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * Acquires the ledger writer lock, opens the ledger, folds every un-ingested run,
  * collapses the WAL, and closes again. The entry point for the CLI and for any
  * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
  * first dies with "File is locked by another process" before it can queue on
- * anything. Taking the ingest lock around the open turns that crash into a wait,
+ * anything. Taking the ledger writer lock around the open turns that crash into a wait,
  * and closing before release means the next holder finds the file free.
  */
 export async function ingest(): Promise<IngestResult> {
-  const result = await withIngestLock(async () => {
+  const result = await withLedgerWriterLock(async () => {
     const database = await openLedger()
 
     let folded: IngestResult

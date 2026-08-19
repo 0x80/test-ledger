@@ -21,11 +21,12 @@ export const eventsPath = (runId: string, pid: number): string =>
 export const databasePath = (): string => path.join(ledgerDir(), 'ledger.db')
 
 /**
- * The lock `ingestAll` holds for the duration of a fold, so two concurrent
- * `test-ledger ingest` invocations serialize instead of interleaving writes.
+ * The lock every command that writes `ledger.db` holds before opening it, so
+ * concurrent ingest and prune invocations serialize instead of interleaving
+ * writes or colliding on the driver's exclusive file lock.
  *
  * Machine-global like the rest of the ledger directory, which is what makes it
  * work across worktrees: the writers it has to exclude are separate processes
  * started from unrelated checkouts, not threads of one run.
  */
-export const ingestLockPath = (): string => path.join(ledgerDir(), 'ingest.lock')
+export const ledgerWriterLockPath = (): string => path.join(ledgerDir(), 'ledger-writer.lock')

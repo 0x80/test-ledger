@@ -5,8 +5,8 @@ import { hostname, tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { ingestLockPath } from '../src/paths.ts'
-import { withIngestLock } from '../src/store/lock.ts'
+import { ledgerWriterLockPath } from '../src/paths.ts'
+import { withLedgerWriterLock } from '../src/store/lock.ts'
 
 let directory: string
 
@@ -28,17 +28,17 @@ async function sleep(ms: number): Promise<void> {
 /** Backdates the lock file past the staleness window without waiting it out. */
 async function ageLockFile(): Promise<void> {
   const longAgo = new Date(Date.now() - 60 * 60 * 1000)
-  await utimes(ingestLockPath(), longAgo, longAgo)
+  await utimes(ledgerWriterLockPath(), longAgo, longAgo)
 }
 
-describe('withIngestLock', () => {
+describe('withLedgerWriterLock', () => {
   it('holds a lock naming its holder for the duration, then releases it', async () => {
-    await withIngestLock(async () => {
-      const contents: unknown = JSON.parse(await readFile(ingestLockPath(), 'utf8'))
+    await withLedgerWriterLock(async () => {
+      const contents: unknown = JSON.parse(await readFile(ledgerWriterLockPath(), 'utf8'))
       expect(contents).toMatchObject({ pid: process.pid })
     })
 
-    expect(existsSync(ingestLockPath())).toBe(false)
+    expect(existsSync(ledgerWriterLockPath())).toBe(false)
   })
 
   /**
@@ -50,7 +50,7 @@ describe('withIngestLock', () => {
     const order: string[] = []
 
     async function hold(name: string): Promise<void> {
-      await withIngestLock(async () => {
+      await withLedgerWriterLock(async () => {
         order.push(`${name}:enter`)
         await sleep(50)
         order.push(`${name}:exit`)
@@ -65,13 +65,13 @@ describe('withIngestLock', () => {
 
   it('releases the lock when the body throws', async () => {
     await expect(
-      withIngestLock(async () => {
+      withLedgerWriterLock(async () => {
         await sleep(0)
         throw new Error('boom')
       }),
     ).rejects.toThrow('boom')
 
-    expect(existsSync(ingestLockPath())).toBe(false)
+    expect(existsSync(ledgerWriterLockPath())).toBe(false)
   })
 
   /**
@@ -93,18 +93,18 @@ describe('withIngestLock', () => {
 
     mkdirSync(directory, { recursive: true })
     writeFileSync(
-      ingestLockPath(),
+      ledgerWriterLockPath(),
       JSON.stringify({ token: 'dead', pid: deadPid, host: hostname(), acquiredAt: 0 }),
     )
     await ageLockFile()
 
     await expect(
-      withIngestLock(async () => {
+      withLedgerWriterLock(async () => {
         await sleep(0)
         return 'ran'
       }),
     ).resolves.toBe('ran')
-    expect(existsSync(ingestLockPath())).toBe(false)
+    expect(existsSync(ledgerWriterLockPath())).toBe(false)
   })
 
   /**
@@ -120,14 +120,14 @@ describe('withIngestLock', () => {
       acquiredAt: Date.now(),
     })
 
-    await withIngestLock(async () => {
+    await withLedgerWriterLock(async () => {
       await sleep(0)
       /** Stands in for this holder having been reclaimed mid-body. */
-      writeFileSync(ingestLockPath(), successor)
+      writeFileSync(ledgerWriterLockPath(), successor)
     })
 
-    expect(existsSync(ingestLockPath())).toBe(true)
-    expect(await readFile(ingestLockPath(), 'utf8')).toBe(successor)
+    expect(existsSync(ledgerWriterLockPath())).toBe(true)
+    expect(await readFile(ledgerWriterLockPath(), 'utf8')).toBe(successor)
   })
 
   /**
@@ -139,7 +139,7 @@ describe('withIngestLock', () => {
   it('does not reclaim an aged lock whose holder is still running', async () => {
     mkdirSync(directory, { recursive: true })
     writeFileSync(
-      ingestLockPath(),
+      ledgerWriterLockPath(),
       JSON.stringify({
         token: 'alive',
         /** This test process: unambiguously running, on this host. */
@@ -151,7 +151,7 @@ describe('withIngestLock', () => {
     await ageLockFile()
 
     let entered = false
-    const pending = withIngestLock(async () => {
+    const pending = withLedgerWriterLock(async () => {
       await sleep(0)
       entered = true
     })
@@ -160,7 +160,7 @@ describe('withIngestLock', () => {
     expect(entered).toBe(false)
 
     /** Hand it over the only legitimate way: the holder releases. */
-    await rm(ingestLockPath(), { force: true })
+    await rm(ledgerWriterLockPath(), { force: true })
 
     await pending
     expect(entered).toBe(true)
@@ -173,10 +173,10 @@ describe('withIngestLock', () => {
    */
   it('waits on a fresh lock whose contents are unreadable', async () => {
     mkdirSync(directory, { recursive: true })
-    writeFileSync(ingestLockPath(), 'not json')
+    writeFileSync(ledgerWriterLockPath(), 'not json')
 
     let entered = false
-    const pending = withIngestLock(async () => {
+    const pending = withLedgerWriterLock(async () => {
       await sleep(0)
       entered = true
     })

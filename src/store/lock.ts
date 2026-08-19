@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { open, readFile, rm, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 
-import { ingestLockPath, ledgerDir } from '../paths.ts'
+import { ledgerDir, ledgerWriterLockPath } from '../paths.ts'
 
 /**
  * How long to keep retrying before giving up on a held lock.
@@ -28,7 +28,7 @@ const RETRY_INTERVAL_MS = 100
  * also shown to be gone (see {@link holderIsAlive}).
  *
  * A process killed with `SIGKILL` never runs its release, so without
- * reclamation a single hard kill would wedge every later ingest on the machine
+ * reclamation a single hard kill would wedge every later writer on the machine
  * permanently. Age alone is deliberately not sufficient: a first ingest of a
  * long backlog legitimately runs for hours, and reclaiming the lock out from
  * under a live one is the worse failure of the two.
@@ -86,8 +86,8 @@ async function readLockFile(path: string): Promise<LockFileContents | undefined>
  * Pid reuse is the known imprecision: if the holder died and an unrelated
  * process inherited its pid, this reports alive and the lock is never
  * reclaimed, so acquisition fails with the timeout message naming that pid
- * instead. That is the safe direction to be wrong in — a stuck ingest the user
- * can diagnose beats two ingests that both believe they hold the lock.
+ * instead. That is the safe direction to be wrong in: a stuck writer the user
+ * can diagnose beats two writers that both believe they hold the lock.
  */
 function holderIsAlive(holder: LockFileContents | undefined): boolean {
   if (holder === undefined || holder.pid <= 0) return false
@@ -115,13 +115,11 @@ function holderIsAlive(holder: LockFileContents | undefined): boolean {
  * which Node does not expose without a native dependency.
  *
  * The residual race is tolerated because its cost here is bounded and visible.
- * Reaching it requires a lock left by a dead process, two ingests racing to
+ * Reaching it requires a lock left by a dead process, two writers racing to
  * reclaim it within the same instant, and a third acquiring in between. The
- * outcome is not a corrupt ledger: `ingest()` takes this lock *before* opening
- * the database, so two processes that both believed they held it collide on the
- * driver's own exclusive lock on `ledger.db` and one dies with "File is locked
- * by another process" — a crash the user retries, which is also exactly what
- * every ingest did before this lock existed.
+ * outcome is not a corrupt ledger: writer commands take this lock *before*
+ * opening the database, so a successor will wait unless it lands in this narrow
+ * reclaim race.
  */
 async function reclaimIfStale(path: string): Promise<boolean> {
   let modifiedAt: number
@@ -167,7 +165,7 @@ async function reclaimIfStale(path: string): Promise<boolean> {
 }
 
 /**
- * Runs `fn` while holding the ledger's ingest lock.
+ * Runs `fn` while holding the ledger's writer lock.
  *
  * The lock is a file created with the exclusive `wx` flag, which is atomic on
  * every filesystem we care about, so two invocations racing to create it always
@@ -177,13 +175,11 @@ async function reclaimIfStale(path: string): Promise<boolean> {
  * out. (Read alongside {@link reclaimIfStale}, which is candid about the one
  * window neither mechanism closes.)
  *
- * Held for the whole fold rather than per statement: the thing being made
- * mutually exclusive is one ingest against another, and a per-statement lock
- * would let two invocations interleave whole runs while never overlapping on a
- * single write.
+ * Held for the whole database operation rather than per statement: a
+ * per-statement lock would let writers interleave partial operations.
  */
-export async function withIngestLock<T>(fn: () => Promise<T>): Promise<T> {
-  const path = ingestLockPath()
+export async function withLedgerWriterLock<T>(fn: () => Promise<T>): Promise<T> {
+  const path = ledgerWriterLockPath()
   const token = crypto.randomUUID()
 
   mkdirSync(ledgerDir(), { recursive: true })
@@ -207,7 +203,7 @@ export async function withIngestLock<T>(fn: () => Promise<T>): Promise<T> {
         /**
          * The exclusive create succeeded, so this process owns the file even
          * though it failed to describe itself in it. Leaving it behind would
-         * block every later ingest until the staleness window expired, over a
+         * block every later writer until the staleness window expired, over a
          * failure that has nothing to do with contention.
          */
         try {
@@ -240,7 +236,7 @@ export async function withIngestLock<T>(fn: () => Promise<T>): Promise<T> {
       if (Date.now() >= deadline) {
         const holder = await readLockFile(path)
         throw new Error(
-          `test-ledger ingest lock at ${path} is held by pid ${holder?.pid ?? 'unknown'} on ${
+          `test-ledger ledger writer lock at ${path} is held by pid ${holder?.pid ?? 'unknown'} on ${
             holder?.host ?? 'unknown'
           }; gave up after ${ACQUIRE_TIMEOUT_MS}ms`,
           { cause: error },

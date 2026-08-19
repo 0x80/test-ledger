@@ -4,7 +4,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { ingest, ingestAll, ingestRun } from '../src/store/ingest.ts'
-import { withIngestLock } from '../src/store/lock.ts'
+import { withLedgerWriterLock } from '../src/store/lock.ts'
 import { openLedger } from '../src/store/open.ts'
 
 let directory: string
@@ -266,7 +266,7 @@ describe('ingest', () => {
    * that gets the ordering right, and this pins it — the sweep must not finish
    * until an unrelated lock holder has let go.
    */
-  it('waits for the ingest lock before opening the ledger', async () => {
+  it('waits for the ledger writer lock before opening the ledger', async () => {
     writeRun('r1', [{ kind: 'test', runId: 'r1', file: '/a.ts', fullName: 'x', state: 'passed' }])
 
     const completed: string[] = []
@@ -286,7 +286,7 @@ describe('ingest', () => {
       letGo = resolve
     })
 
-    const holder = withIngestLock(async () => {
+    const holder = withLedgerWriterLock(async () => {
       signalAcquired()
       await held
       completed.push('holder')

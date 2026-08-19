@@ -1,10 +1,10 @@
 import {
   a as runDir,
-  i as ledgerDir,
+  i as ledgerWriterLockPath,
   o as runsDir,
-  r as ingestLockPath,
+  r as ledgerDir,
   t as databasePath,
-} from './paths-CmAFgNp9.mjs'
+} from './paths-s98kclyI.mjs'
 import { open, readFile, rm, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import path from 'node:path'
@@ -281,7 +281,7 @@ const RETRY_INTERVAL_MS = 100
  * also shown to be gone (see {@link holderIsAlive}).
  *
  * A process killed with `SIGKILL` never runs its release, so without
- * reclamation a single hard kill would wedge every later ingest on the machine
+ * reclamation a single hard kill would wedge every later writer on the machine
  * permanently. Age alone is deliberately not sufficient: a first ingest of a
  * long backlog legitimately runs for hours, and reclaiming the lock out from
  * under a live one is the worse failure of the two.
@@ -329,8 +329,8 @@ async function readLockFile(path$1) {
  * Pid reuse is the known imprecision: if the holder died and an unrelated
  * process inherited its pid, this reports alive and the lock is never
  * reclaimed, so acquisition fails with the timeout message naming that pid
- * instead. That is the safe direction to be wrong in — a stuck ingest the user
- * can diagnose beats two ingests that both believe they hold the lock.
+ * instead. That is the safe direction to be wrong in: a stuck writer the user
+ * can diagnose beats two writers that both believe they hold the lock.
  */
 function holderIsAlive(holder) {
   if (holder === void 0 || holder.pid <= 0) return false
@@ -356,13 +356,11 @@ function holderIsAlive(holder) {
  * which Node does not expose without a native dependency.
  *
  * The residual race is tolerated because its cost here is bounded and visible.
- * Reaching it requires a lock left by a dead process, two ingests racing to
+ * Reaching it requires a lock left by a dead process, two writers racing to
  * reclaim it within the same instant, and a third acquiring in between. The
- * outcome is not a corrupt ledger: `ingest()` takes this lock *before* opening
- * the database, so two processes that both believed they held it collide on the
- * driver's own exclusive lock on `ledger.db` and one dies with "File is locked
- * by another process" — a crash the user retries, which is also exactly what
- * every ingest did before this lock existed.
+ * outcome is not a corrupt ledger: writer commands take this lock *before*
+ * opening the database, so a successor will wait unless it lands in this narrow
+ * reclaim race.
  */
 async function reclaimIfStale(path$1) {
   let modifiedAt
@@ -389,7 +387,7 @@ async function reclaimIfStale(path$1) {
   return true
 }
 /**
- * Runs `fn` while holding the ledger's ingest lock.
+ * Runs `fn` while holding the ledger's writer lock.
  *
  * The lock is a file created with the exclusive `wx` flag, which is atomic on
  * every filesystem we care about, so two invocations racing to create it always
@@ -399,13 +397,11 @@ async function reclaimIfStale(path$1) {
  * out. (Read alongside {@link reclaimIfStale}, which is candid about the one
  * window neither mechanism closes.)
  *
- * Held for the whole fold rather than per statement: the thing being made
- * mutually exclusive is one ingest against another, and a per-statement lock
- * would let two invocations interleave whole runs while never overlapping on a
- * single write.
+ * Held for the whole database operation rather than per statement: a
+ * per-statement lock would let writers interleave partial operations.
  */
-async function withIngestLock(fn) {
-  const path$1 = ingestLockPath()
+async function withLedgerWriterLock(fn) {
+  const path$1 = ledgerWriterLockPath()
   const token = crypto.randomUUID()
   mkdirSync(ledgerDir(), { recursive: true })
   const deadline = Date.now() + ACQUIRE_TIMEOUT_MS
@@ -427,7 +423,7 @@ async function withIngestLock(fn) {
         /**
          * The exclusive create succeeded, so this process owns the file even
          * though it failed to describe itself in it. Leaving it behind would
-         * block every later ingest until the staleness window expired, over a
+         * block every later writer until the staleness window expired, over a
          * failure that has nothing to do with contention.
          */
         try {
@@ -450,7 +446,7 @@ async function withIngestLock(fn) {
       if (Date.now() >= deadline) {
         const holder = await readLockFile(path$1)
         throw new Error(
-          `test-ledger ingest lock at ${path$1} is held by pid ${holder?.pid ?? 'unknown'} on ${holder?.host ?? 'unknown'}; gave up after ${ACQUIRE_TIMEOUT_MS}ms`,
+          `test-ledger ledger writer lock at ${path$1} is held by pid ${holder?.pid ?? 'unknown'} on ${holder?.host ?? 'unknown'}; gave up after ${ACQUIRE_TIMEOUT_MS}ms`,
           { cause: error },
         )
       }
@@ -778,9 +774,9 @@ const TEST_COLUMNS = [
  * only supported with UPSERT", so the upsert form is used instead; it is the
  * standard-SQL equivalent and converges to the same rows.
  *
- * Not self-locking: {@link ingestAll} holds the ingest lock across every run it
+ * Not self-locking: {@link ingestAll} holds the ledger writer lock across every run it
  * folds, and acquiring it here as well would deadlock. A caller driving
- * `ingestRun` directly wraps it in {@link withIngestLock} itself.
+ * `ingestRun` directly wraps it in {@link withLedgerWriterLock} itself.
  */
 async function ingestRun(database, runId) {
   if (
@@ -893,7 +889,7 @@ async function ingestRun(database, runId) {
     return sampleRows.length + turboTaskRows.length + fileRows.size + testRows.size
   })
 }
-/** The sweep itself. Both exported entry points below run it under the ingest lock. */
+/** The sweep itself. Both exported entry points below run it under the ledger writer lock. */
 async function foldUnIngestedRuns(database) {
   let directories
   try {
@@ -921,7 +917,7 @@ async function foldUnIngestedRuns(database) {
 /**
  * Folds every un-ingested run directory into an already-open ledger.
  *
- * Holds the ingest lock for the whole sweep rather than per run: taking it per
+ * Holds the ledger writer lock for the whole sweep rather than per run: taking it per
  * run would let a second invocation slot whole runs in between a first one's,
  * which is exactly the interleaving the lock exists to prevent.
  *
@@ -932,7 +928,7 @@ async function foldUnIngestedRuns(database) {
  * before the file is opened, which is what `ingest` does.
  */
 async function ingestAll(database) {
-  return await withIngestLock(async () => {
+  return await withLedgerWriterLock(async () => {
     return await foldUnIngestedRuns(database)
   })
 }
@@ -946,7 +942,7 @@ async function ingestAll(database) {
  *
  * The one cost worth naming: a connection that failed to close may still hold
  * the driver's exclusive OS lock on `ledger.db` after this function releases
- * the ingest lock, so the next ingest could fail at open rather than queue.
+ * the ledger writer lock, so the next writer could fail at open rather than queue.
  * For the CLI that is unreachable — the process exits immediately afterward and
  * the OS drops the handle — and for a long-lived caller a failed close is
  * already a broken connection it has to deal with. Swallowing is still the
@@ -978,18 +974,18 @@ async function checkpointQuietly(database) {
   } catch {}
 }
 /**
- * Acquires the ingest lock, opens the ledger, folds every un-ingested run,
+ * Acquires the ledger writer lock, opens the ledger, folds every un-ingested run,
  * collapses the WAL, and closes again. The entry point for the CLI and for any
  * automated caller.
  *
  * The ordering is the whole point: `@tursodatabase/database` takes an exclusive
  * OS-level lock on `ledger.db` when it opens, so a second invocation that opens
  * first dies with "File is locked by another process" before it can queue on
- * anything. Taking the ingest lock around the open turns that crash into a wait,
+ * anything. Taking the ledger writer lock around the open turns that crash into a wait,
  * and closing before release means the next holder finds the file free.
  */
 async function ingest() {
-  return await withIngestLock(async () => {
+  return await withLedgerWriterLock(async () => {
     const database = await openLedger()
     let folded
     try {
@@ -1015,7 +1011,7 @@ async function ingest() {
 
 //#endregion
 export {
-  withIngestLock as a,
+  withLedgerWriterLock as a,
   shapeReport as c,
   contentionReport as d,
   table as f,

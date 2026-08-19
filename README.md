@@ -34,7 +34,7 @@ no registry, no token, no global pnpm config.
   (`writeRunStart`, `writeRunEnd`, `appendEvents`), the load sampler (`startSampler`), the Turbo
   summary parser (`parseTurboSummary`), the run-id minter (`mintRunId`), the failure classifier
   (`classifyFailure`), the event types (`LedgerEvent`, `Lane`, `FailureClass`, …), the store
-  (`openLedger`, `ingest`, `ingestAll`, `ingestRun`, `withIngestLock`), and every report (`flakyReport`, `slowReport`,
+  (`openLedger`, `ingest`, `ingestAll`, `ingestRun`, `withLedgerWriterLock`), and every report (`flakyReport`, `slowReport`,
   `contentionReport`, `shapeReport`, `runsReport`).
 - **`./reporter`** — `TestLedgerReporter`, the Vitest custom reporter. Kept as its own subpath so a
   Vitest config can resolve it as a reporter module path without pulling the rest of the package's
@@ -158,12 +158,11 @@ prevent:
   by leaving nothing behind for the retry to duplicate. Both matter because `run_samples` and
   `turbo_tasks` are append-only with no per-row key, so unlike the other four tables they have no
   convergence of their own and would simply append a second copy.
-- **Ingest is serialized by a lock.** `test-ledger ingest` holds `ingest.lock` in the ledger
-  directory for the whole fold, taken before the database file is opened — the driver locks that
-  file exclusively at open, so without it a second concurrent invocation would die on the file
-  rather than queue. A lock is reclaimed only once it is both older than ten minutes _and_ its
-  recorded holder is no longer running, so a genuine hours-long backlog ingest is never reclaimed
-  out from under itself.
+- **Ledger writers are serialized by a lock.** `test-ledger ingest` and `test-ledger prune` hold
+  `ledger-writer.lock` in the ledger directory before opening the database file. The driver locks
+  that file exclusively at open, so the shared lock makes a concurrent writer wait instead of die.
+  A lock is reclaimed only once it is both older than ten minutes _and_ its recorded holder is no
+  longer running, so a genuine hours-long backlog ingest is never reclaimed out from under itself.
 - **Ingest collapses the WAL when it finishes.** Without that the write-ahead log only grows; a
   999-run backlog folded through the old row-at-a-time path left a 41 GB WAL beside a 1.4 GB
   database. The same backlog through the batched path is about 1.6 GB total.
