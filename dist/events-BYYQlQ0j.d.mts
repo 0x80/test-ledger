@@ -37,6 +37,8 @@ type RunStartEvent = {
   totalMemoryBytes: number
   concurrency: number
   liveSlots: number
+  queuedMs: number
+  queueTimedOut: boolean
   turboForce: boolean
 }
 type RunEndEvent = {

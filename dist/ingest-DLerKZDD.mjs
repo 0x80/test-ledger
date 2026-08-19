@@ -71,6 +71,8 @@ async function contentionReport(database, options = {}) {
               COALESCE(r.started_at, 0) AS startedAt,
               COALESCE(r.ended_at - r.started_at, 0) AS durationMs,
               COALESCE(r.concurrency, 0) AS concurrency,
+              COALESCE(r.queued_ms, 0) AS queuedMs,
+              COALESCE(r.queue_timed_out, 0) AS queueTimedOut,
               COALESCE(AVG(s.load1), 0) AS meanLoad1,
               COALESCE(MAX(s.load1), 0) AS peakLoad1,
               COALESCE(MAX(s.live_slots), 0) AS peakLiveSlots
@@ -469,9 +471,9 @@ async function withIngestLock(fn) {
 /**
  * The phase 1 schema.
  *
- * Every statement is `IF NOT EXISTS`, so applying it on every open is the
- * migration story for phase 1. A real migration ladder can wait until the
- * schema has to change under data someone would miss.
+ * Every fresh-table statement is `IF NOT EXISTS`, so opening an empty ledger
+ * is idempotent. `openLedger` applies additive column upgrades separately for
+ * schema changes that must work against an existing ledger file.
  */
 const SCHEMA = `
 /** Every table keys on run_id; a run is the unit of ingest and of pruning. */
@@ -491,6 +493,8 @@ CREATE TABLE IF NOT EXISTS runs (
   total_memory_bytes INTEGER,
   concurrency INTEGER,
   live_slots INTEGER,
+  queued_ms INTEGER,
+  queue_timed_out INTEGER,
   turbo_force INTEGER,
   /** 0 when the run had no envelope (an ad-hoc invocation outside the wrapper). */
   has_envelope INTEGER NOT NULL DEFAULT 0
@@ -568,6 +572,26 @@ CREATE TABLE IF NOT EXISTS ingested_runs (
 
 //#endregion
 //#region src/store/open.ts
+const RUN_COLUMN_UPGRADES = [
+  {
+    name: 'queued_ms',
+    statement: 'ALTER TABLE runs ADD COLUMN queued_ms INTEGER',
+  },
+  {
+    name: 'queue_timed_out',
+    statement: 'ALTER TABLE runs ADD COLUMN queue_timed_out INTEGER',
+  },
+]
+/** Adds columns introduced after an existing ledger file's `runs` table was first created. */
+async function applyRunColumnUpgrades(database) {
+  for (const upgrade of RUN_COLUMN_UPGRADES)
+    if (
+      (await database
+        .prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?')
+        .get(['runs', upgrade.name])) === void 0
+    )
+      await database.exec(upgrade.statement)
+}
 /**
  * Opens the local ledger, applying the schema every time.
  *
@@ -590,6 +614,7 @@ async function openLedger() {
   mkdirSync(ledgerDir(), { recursive: true })
   const database = await connect(databasePath())
   await database.exec(SCHEMA)
+  await applyRunColumnUpgrades(database)
   return database
 }
 
@@ -720,6 +745,8 @@ const RUN_COLUMNS = [
   'total_memory_bytes',
   'concurrency',
   'live_slots',
+  'queued_ms',
+  'queue_timed_out',
   'turbo_force',
   'has_envelope',
 ]
@@ -806,6 +833,8 @@ async function ingestRun(database, runId) {
     start?.totalMemoryBytes ?? null,
     start?.concurrency ?? null,
     start?.liveSlots ?? null,
+    start?.queuedMs ?? null,
+    start?.queueTimedOut === void 0 ? null : Number(start.queueTimedOut),
     start?.turboForce === void 0 ? null : Number(start.turboForce),
     start === void 0 ? 0 : 1,
   ]

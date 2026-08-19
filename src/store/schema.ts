@@ -1,9 +1,9 @@
 /**
  * The phase 1 schema.
  *
- * Every statement is `IF NOT EXISTS`, so applying it on every open is the
- * migration story for phase 1. A real migration ladder can wait until the
- * schema has to change under data someone would miss.
+ * Every fresh-table statement is `IF NOT EXISTS`, so opening an empty ledger
+ * is idempotent. `openLedger` applies additive column upgrades separately for
+ * schema changes that must work against an existing ledger file.
  */
 export const SCHEMA = `
 /** Every table keys on run_id; a run is the unit of ingest and of pruning. */
@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS runs (
   total_memory_bytes INTEGER,
   concurrency INTEGER,
   live_slots INTEGER,
+  queued_ms INTEGER,
+  queue_timed_out INTEGER,
   turbo_force INTEGER,
   /** 0 when the run had no envelope (an ad-hoc invocation outside the wrapper). */
   has_envelope INTEGER NOT NULL DEFAULT 0
