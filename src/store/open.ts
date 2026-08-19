@@ -7,6 +7,21 @@ import { SCHEMA } from './schema.ts'
 
 export type Ledger = Awaited<ReturnType<typeof connect>>
 
+const RUN_COLUMN_UPGRADES = [
+  { name: 'queued_ms', statement: 'ALTER TABLE runs ADD COLUMN queued_ms INTEGER' },
+  { name: 'queue_timed_out', statement: 'ALTER TABLE runs ADD COLUMN queue_timed_out INTEGER' },
+] as const
+
+/** Adds columns introduced after an existing ledger file's `runs` table was first created. */
+async function applyRunColumnUpgrades(database: Ledger): Promise<void> {
+  for (const upgrade of RUN_COLUMN_UPGRADES) {
+    const existing: unknown = await database
+      .prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?')
+      .get(['runs', upgrade.name])
+    if (existing === undefined) await database.exec(upgrade.statement)
+  }
+}
+
 /**
  * Opens the local ledger, applying the schema every time.
  *
@@ -30,6 +45,7 @@ export async function openLedger(): Promise<Ledger> {
 
   const database = await connect(databasePath())
   await database.exec(SCHEMA)
+  await applyRunColumnUpgrades(database)
 
   return database
 }

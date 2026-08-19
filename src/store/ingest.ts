@@ -163,6 +163,8 @@ const RUN_COLUMNS = [
   'total_memory_bytes',
   'concurrency',
   'live_slots',
+  'queued_ms',
+  'queue_timed_out',
   'turbo_force',
   'has_envelope',
 ] as const
@@ -270,6 +272,8 @@ export async function ingestRun(database: Ledger, runId: string): Promise<number
     start?.totalMemoryBytes ?? null,
     start?.concurrency ?? null,
     start?.liveSlots ?? null,
+    start?.queuedMs ?? null,
+    start?.queueTimedOut === undefined ? null : Number(start.queueTimedOut),
     start?.turboForce === undefined ? null : Number(start.turboForce),
     start === undefined ? 0 : 1,
   ]

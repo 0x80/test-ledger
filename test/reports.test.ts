@@ -1,13 +1,16 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { connect } from '@tursodatabase/database'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { flakyReport } from '../src/reports/flaky.ts'
+import { contentionReport } from '../src/reports/contention.ts'
 import { shapeReport } from '../src/reports/shape.ts'
 import { slowReport } from '../src/reports/slow.ts'
 import { ingestAll } from '../src/store/ingest.ts'
 import { openLedger } from '../src/store/open.ts'
+import { databasePath } from '../src/paths.ts'
 
 let directory: string
 
@@ -221,5 +224,65 @@ describe('reports', () => {
     const row = rows.find((candidate) => candidate.packageName === '@repo/db')
 
     expect(row).toMatchObject({ turboTasks: 2, turboCacheHits: 1, turboCacheMisses: 1 })
+  })
+
+  it('persists an integration queue wait and reports it with host contention', async () => {
+    writeRun('r1', [
+      {
+        kind: 'run_start',
+        runId: 'r1',
+        startedAt: 100,
+        branch: 'ran-2228',
+        concurrency: 3,
+        queuedMs: 12_500,
+        queueTimedOut: true,
+      },
+      { kind: 'sample', runId: 'r1', at: 110, load1: 4, liveSlots: 3 },
+      { kind: 'run_end', runId: 'r1', endedAt: 200, exitCode: 0 },
+    ])
+    const database = await openLedger()
+    await ingestAll(database)
+
+    const stored = await database
+      .prepare('SELECT queued_ms, queue_timed_out FROM runs WHERE run_id = ?')
+      .get(['r1'])
+    expect(stored).toMatchObject({ queued_ms: 12_500, queue_timed_out: 1 })
+
+    await expect(contentionReport(database)).resolves.toMatchObject([
+      { runId: 'r1', queuedMs: 12_500, queueTimedOut: 1 },
+    ])
+  })
+
+  it('adds the queue fields to a ledger created before they existed', async () => {
+    const legacy = await connect(databasePath())
+    await legacy.exec(`
+      CREATE TABLE runs (
+        run_id TEXT PRIMARY KEY,
+        started_at INTEGER,
+        ended_at INTEGER,
+        exit_code INTEGER,
+        invocation TEXT,
+        repo TEXT,
+        branch TEXT,
+        worktree TEXT,
+        git_sha TEXT,
+        dirty INTEGER,
+        host_id TEXT,
+        cpu_count INTEGER,
+        total_memory_bytes INTEGER,
+        concurrency INTEGER,
+        live_slots INTEGER,
+        turbo_force INTEGER,
+        has_envelope INTEGER NOT NULL DEFAULT 0
+      );
+    `)
+    await legacy.close()
+
+    const database = await openLedger()
+    const columns = await database.prepare('PRAGMA table_info(runs)').all()
+    const names = columns.map((column) => (column as { name: string }).name)
+
+    expect(names).toContain('queued_ms')
+    expect(names).toContain('queue_timed_out')
   })
 })
