@@ -9,6 +9,8 @@ export type ContentionRow = {
   peakLoad1: number
   peakLiveSlots: number
   concurrency: number
+  queuedMs: number
+  queueTimedOut: number
 }
 
 /**
@@ -38,6 +40,8 @@ export async function contentionReport(
               COALESCE(r.started_at, 0) AS startedAt,
               COALESCE(r.ended_at - r.started_at, 0) AS durationMs,
               COALESCE(r.concurrency, 0) AS concurrency,
+              COALESCE(r.queued_ms, 0) AS queuedMs,
+              COALESCE(r.queue_timed_out, 0) AS queueTimedOut,
               COALESCE(AVG(s.load1), 0) AS meanLoad1,
               COALESCE(MAX(s.load1), 0) AS peakLoad1,
               COALESCE(MAX(s.live_slots), 0) AS peakLiveSlots

@@ -38,6 +38,8 @@ describe('the run envelope', () => {
       dirty: false,
       concurrency: 9,
       liveSlots: 1,
+      queuedMs: 12_500,
+      queueTimedOut: true,
       turboForce: true,
     })
     writeRunEnd('r1', 0)
@@ -46,6 +48,8 @@ describe('the run envelope', () => {
     expect(events.find((event) => event['kind'] === 'run_start')).toMatchObject({
       branch: 'main',
       concurrency: 9,
+      queuedMs: 12_500,
+      queueTimedOut: true,
       turboForce: true,
     })
     expect(events.find((event) => event['kind'] === 'run_end')).toMatchObject({ exitCode: 0 })

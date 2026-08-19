@@ -1,8 +1,8 @@
 # @0x80/test-ledger
 
-Telemetry for local test runs: per-file and per-test records, host load while a run was in
-progress, and the Turbo task summary — folded into a local SQLite database and queried by five
-canned reports (`flaky`, `slow`, `contention`, `shape`, `runs`).
+Telemetry for local test runs: per-file and per-test records, host load and queue wait while a run
+was in progress, and the Turbo task summary. The package folds this into a local SQLite database and
+queries it through five canned reports (`flaky`, `slow`, `contention`, `shape`, `runs`).
 
 ## Why
 
@@ -87,6 +87,8 @@ writeRunStart(runId, {
   dirty: isDirty(),
   concurrency: resolvedConcurrency,
   liveSlots: countLiveSlots(),
+  queuedMs: waitedMs,
+  queueTimedOut: waitTimedOut,
   turboForce: usedForce,
 })
 
@@ -113,7 +115,7 @@ Every command reads the local database (`~/.local/share/test-ledger/ledger.db` b
 | `ingest`     | Folds every un-ingested run directory's NDJSON into the database           |
 | `flaky`      | Tests ranked by failure rate, with denominators and a failure-class split  |
 | `slow`       | Files ranked by their share of total summed duration                       |
-| `contention` | Runs ranked by host load while they ran                                    |
+| `contention` | Runs ranked by host load, with their queue wait and timeout status         |
 | `shape`      | Where time goes, broken out by package and lane, plus Turbo cache-hit rate |
 | `runs`       | Recent run history                                                         |
 | `prune`      | Deletes runs and their NDJSON older than `--days` (default 90)             |
