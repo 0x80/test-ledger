@@ -9,21 +9,18 @@ import {
   s as slowReport,
   t as ingest,
   u as flakyReport,
-} from './ingest-DXYNLfRj.mjs'
-import { a as runDir } from './paths-s98kclyI.mjs'
-import { rm } from 'node:fs/promises'
+} from './ingest-FjXCCB3z.mjs'
+import { a as runDir } from './paths-ZwcASZDt.mjs'
 import meow from 'meow'
+import { rm } from 'node:fs/promises'
 
-//#region src/cli.ts
+//#region src/store/prune.ts
 /**
  * Removes one run's NDJSON directory.
  *
  * A missing directory is not an error: the run may have been ingested on one
  * machine and pruned on another, or a prior prune already removed it. Only
- * `ENOENT` is swallowed, mirroring the narrowing `ingest.ts`'s
- * `readRunEvents` applies to the same failure mode; any other error (a
- * permissions problem, a busy handle) is a real filesystem failure and must
- * propagate.
+ * `ENOENT` is swallowed; any other filesystem failure must propagate.
  */
 async function removeRunDirectory(runId) {
   try {
@@ -71,6 +68,9 @@ async function prune(days) {
     }
   })
 }
+
+//#endregion
+//#region src/cli.ts
 /** The `test-ledger` bin entry point: ingest, the five reports, and prune. */
 const cli = meow(
   `

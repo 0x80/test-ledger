@@ -175,8 +175,6 @@ prevent:
 
 Honestly, not aspirationally:
 
-- **Only ingest takes the lock.** `prune` writes to the same database without holding it, so a
-  prune racing an ingest still fails on the driver's own file lock rather than waiting for its turn.
 - **No sync.** Everything here is local-only, through `@tursodatabase/database`. Pushing this data
   to a shared/remote database (`@tursodatabase/sync`, credentials, `push()`) is designed but not
   built — a synced database carries change-tracking state a local-only file doesn't, so that phase

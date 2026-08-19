@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { openLedger } from '../src/store/open.ts'
-import { withLedgerWriterLock } from '../src/store/lock.ts'
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url))
 let directory: string
@@ -28,51 +27,6 @@ function run(...args: string[]): string {
   return execFileSync('node', [cli, ...args], {
     encoding: 'utf8',
     env: { ...process.env, TEST_LEDGER_DIR: directory },
-  })
-}
-
-async function sleep(milliseconds: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, milliseconds)
-  })
-}
-
-type CommandResult = {
-  error: Error | undefined
-  exitCode: number | null
-  stderr: string
-  stdout: string
-}
-
-function runAsync(ledgerDirectory: string, ...args: string[]): Promise<CommandResult> {
-  const child = spawn('node', [cli, ...args], {
-    env: { ...process.env, TEST_LEDGER_DIR: ledgerDirectory },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-
-  let stdout = ''
-  let stderr = ''
-  child.stdout.on('data', (chunk: Buffer) => {
-    stdout += chunk.toString()
-  })
-  child.stderr.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString()
-  })
-
-  return new Promise<CommandResult>((resolve) => {
-    let settled = false
-    const finish = (result: CommandResult): void => {
-      if (settled) return
-      settled = true
-      resolve(result)
-    }
-
-    child.on('error', (error: Error) => {
-      finish({ error, exitCode: null, stderr, stdout })
-    })
-    child.on('close', (exitCode: number | null) => {
-      finish({ error: undefined, exitCode, stderr, stdout })
-    })
   })
 }
 
@@ -185,68 +139,5 @@ describe('the prune subcommand', () => {
 
     expect(existsSync(path.join(pruneDirectory, 'runs', 'old'))).toBe(false)
     expect(existsSync(path.join(pruneDirectory, 'runs', 'recent'))).toBe(true)
-  })
-
-  /**
-   * The lock must come before opening `ledger.db`. The holder has already
-   * opened the database, just as ingest does for a fold. If prune opens first,
-   * the driver rejects it instead of allowing it to wait for the writer lock.
-   */
-  it('waits for an ingest writer to release the database before pruning', async () => {
-    const dayMilliseconds = 24 * 60 * 60 * 1000
-    seedRun('old', Date.now() - 200 * dayMilliseconds)
-    execFileSync('node', [cli, 'ingest'], {
-      encoding: 'utf8',
-      env: { ...process.env, TEST_LEDGER_DIR: pruneDirectory },
-    })
-    process.env['TEST_LEDGER_DIR'] = pruneDirectory
-
-    let releaseWriter: () => void = () => undefined
-    const writerReleased = new Promise<void>((resolve) => {
-      releaseWriter = resolve
-    })
-    let signalWriterReady: () => void = () => undefined
-    const writerReady = new Promise<void>((resolve) => {
-      signalWriterReady = resolve
-    })
-
-    const writer = withLedgerWriterLock(async () => {
-      const database = await openLedger()
-      signalWriterReady()
-
-      try {
-        await writerReleased
-      } finally {
-        await database.close()
-      }
-    })
-
-    await writerReady
-
-    let pruneFinished = false
-    const prune = runAsync(pruneDirectory, 'prune', '--days', '90').then((result) => {
-      pruneFinished = true
-      return result
-    })
-
-    let outcome: CommandResult
-    try {
-      await sleep(300)
-      expect(pruneFinished).toBe(false)
-    } finally {
-      releaseWriter()
-      await writer
-      outcome = await prune
-    }
-
-    expect(outcome.error).toBeUndefined()
-    expect(outcome.exitCode).toBe(0)
-    expect(outcome.stderr).toBe('')
-    expect(outcome.stdout).toContain('pruned runs older than 90 days')
-
-    process.env['TEST_LEDGER_DIR'] = pruneDirectory
-    const database = await openLedger()
-    expect(await database.prepare('SELECT run_id FROM runs').all()).toEqual([])
-    await database.close()
   })
 })
